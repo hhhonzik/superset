@@ -66,7 +66,7 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
   --label "built_at=$(date)" \
   --label "target=lean" \
   --label "build_actor=${GITHUB_ACTOR}" \
-  --push
+  --push \
   .
 
 #
