@@ -49,8 +49,8 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
 #
 DOCKER_BUILDKIT=1 docker buildx build --target lean \
   -t "${REPO_NAME}:${SHA}-py310" \
-  -t "${REPO_NAME}:${REFSPEC}-py310" \
-  -t "${REPO_NAME}:${LATEST_TAG}-py310" \
+  # -t "${REPO_NAME}:${REFSPEC}-py310" \
+  # -t "${REPO_NAME}:${LATEST_TAG}-py310" \
   --build-arg PY_VER="3.10-slim"\
   --label "sha=${SHA}" \
   --platform linux/arm64/v8 \
@@ -64,8 +64,8 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
 #
 DOCKER_BUILDKIT=1 docker buildx build \
   -t "${REPO_NAME}:${SHA}-websocket" \
-  -t "${REPO_NAME}:${REFSPEC}-websocket" \
-  -t "${REPO_NAME}:${LATEST_TAG}-websocket" \
+  # -t "${REPO_NAME}:${REFSPEC}-websocket" \
+  # -t "${REPO_NAME}:${LATEST_TAG}-websocket" \
   --label "sha=${SHA}" \
   --platform linux/arm64/v8 \
   --label "built_at=$(date)" \
@@ -78,8 +78,8 @@ DOCKER_BUILDKIT=1 docker buildx build \
 #
 DOCKER_BUILDKIT=1 docker buildx build --target dev \
   -t "${REPO_NAME}:${SHA}-dev" \
-  -t "${REPO_NAME}:${REFSPEC}-dev" \
-  -t "${REPO_NAME}:${LATEST_TAG}-dev" \
+  # -t "${REPO_NAME}:${REFSPEC}-dev" \
+  # -t "${REPO_NAME}:${LATEST_TAG}-dev" \
   --label "sha=${SHA}" \
   --platform linux/arm64/v8 \
   --label "built_at=$(date)" \
