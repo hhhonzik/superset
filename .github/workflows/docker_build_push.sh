@@ -51,6 +51,7 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
   -t "${REPO_NAME}:${REFSPEC}" \
   -t "${REPO_NAME}:${LATEST_TAG}" \
   --platform linux/arm64,linux/amd64 \
+  --output=type=docker \
   --label "sha=${SHA}" \
   --label "built_at=$(date)" \
   --label "target=lean" \
@@ -67,6 +68,7 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
   --build-arg PY_VER="3.10-slim"\
   --label "sha=${SHA}" \
   --platform linux/arm64,linux/amd64 \
+  --output=type=docker \
   --label "built_at=$(date)" \
   --label "target=lean310" \
   --label "build_actor=${GITHUB_ACTOR}" \
@@ -81,6 +83,7 @@ DOCKER_BUILDKIT=1 docker buildx build \
   -t "${REPO_NAME}:${LATEST_TAG}-websocket" \
   --label "sha=${SHA}" \
   --platform linux/arm64,linux/amd64 \
+  --output=type=docker \
   --label "built_at=$(date)" \
   --label "target=websocket" \
   --label "build_actor=${GITHUB_ACTOR}" \
@@ -95,6 +98,7 @@ DOCKER_BUILDKIT=1 docker buildx build \
 #   -t "${REPO_NAME}:${LATEST_TAG}-dev" \
 #   --label "sha=${SHA}" \
 #   --platform linux/arm64,linux/amd64 \
+--output=type=docker \
 #   --label "built_at=$(date)" \
 #   --label "target=dev" \
 #   --label "build_actor=${GITHUB_ACTOR}" \
