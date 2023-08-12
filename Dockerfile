@@ -111,7 +111,9 @@ ARG FIREFOX_VERSION=106.0.3
 
 USER root
 
-RUN apt-get update -q \
+# Gecko x64 suffix is `-linux64` and arm is `-linux-aarch64`
+RUN GECKODRIVER_PLATFORM=$(if [ "$(arch)" = "aarch64" ]; then echo "-aarch64"; else echo "64"; fi) \
+    apt-get update -q \
     && apt-get install -yq --no-install-recommends \
         libnss3 \
         libdbus-glib-1-2 \
@@ -120,11 +122,10 @@ RUN apt-get update -q \
         libasound2 \
         libxtst6 \
         wget \
+        firefox-esr@${FIREFOX_VERSION} \
     # Install GeckoDriver WebDriver
-    && wget https://github.com/mozilla/geckodriver/releases/download/${GECKODRIVER_VERSION}/geckodriver-${GECKODRIVER_VERSION}-linux64.tar.gz -O - | tar xfz - -C /usr/local/bin \
-    # Install Firefox
-    && wget https://download-installer.cdn.mozilla.net/pub/firefox/releases/${FIREFOX_VERSION}/linux-x86_64/en-US/firefox-${FIREFOX_VERSION}.tar.bz2 -O - | tar xfj - -C /opt \
-    && ln -s /opt/firefox/firefox /usr/local/bin/firefox \
+    && wget https://github.com/mozilla/geckodriver/releases/download/${GECKODRIVER_VERSION}/geckodriver-${GECKODRIVER_VERSION}-linux${GECKODRIVER_PLATFORM}.tar.gz -O - | tar xfz - -C /usr/local/bin \
+    # Autoremove
     && apt-get autoremove -yqq --purge wget && rm -rf /var/lib/apt/lists/* && apt-get clean
 
 COPY ./requirements/*.txt ./docker/requirements-*.txt/ /app/requirements/
