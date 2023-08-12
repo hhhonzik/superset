@@ -89,16 +89,16 @@ DOCKER_BUILDKIT=1 docker buildx build \
 #
 # Build the dev image
 #
-DOCKER_BUILDKIT=1 docker buildx build --target dev \
-  -t "${REPO_NAME}:${SHA}-dev" \
-  -t "${REPO_NAME}:${REFSPEC}-dev" \
-  -t "${REPO_NAME}:${LATEST_TAG}-dev" \
-  --label "sha=${SHA}" \
-  --platform linux/arm64,linux/amd64 \
-  --label "built_at=$(date)" \
-  --label "target=dev" \
-  --label "build_actor=${GITHUB_ACTOR}" \
-  .
+# DOCKER_BUILDKIT=1 docker buildx build --target dev \
+#   -t "${REPO_NAME}:${SHA}-dev" \
+#   -t "${REPO_NAME}:${REFSPEC}-dev" \
+#   -t "${REPO_NAME}:${LATEST_TAG}-dev" \
+#   --label "sha=${SHA}" \
+#   --platform linux/arm64,linux/amd64 \
+#   --label "built_at=$(date)" \
+#   --label "target=dev" \
+#   --label "build_actor=${GITHUB_ACTOR}" \
+#   .
 
 #
 # Build the dockerize image
