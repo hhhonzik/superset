@@ -35,9 +35,9 @@ EOF
 #
 # Build the "lean" image
 #
-DOCKER_BUILDKIT=1 docker buildx  build --target lean \
+DOCKER_BUILDKIT=1 docker buildx build --target lean \
   -t "${REPO_NAME}:${SHA}" \
-  --platform linux/arm64/v8
+  --platform linux/arm64/v8 \
   --label "sha=${SHA}" \
   --label "built_at=$(date)" \
   --label "target=lean" \
@@ -53,7 +53,7 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
   -t "${REPO_NAME}:${LATEST_TAG}-py310" \
   --build-arg PY_VER="3.10-slim"\
   --label "sha=${SHA}" \
-  --platform linux/arm64/v8
+  --platform linux/arm64/v8 \
   --label "built_at=$(date)" \
   --label "target=lean310" \
   --label "build_actor=${GITHUB_ACTOR}" \
@@ -67,7 +67,7 @@ DOCKER_BUILDKIT=1 docker buildx build \
   -t "${REPO_NAME}:${REFSPEC}-websocket" \
   -t "${REPO_NAME}:${LATEST_TAG}-websocket" \
   --label "sha=${SHA}" \
-  --platform linux/arm64/v8
+  --platform linux/arm64/v8 \
   --label "built_at=$(date)" \
   --label "target=websocket" \
   --label "build_actor=${GITHUB_ACTOR}" \
@@ -81,7 +81,7 @@ DOCKER_BUILDKIT=1 docker buildx build --target dev \
   -t "${REPO_NAME}:${REFSPEC}-dev" \
   -t "${REPO_NAME}:${LATEST_TAG}-dev" \
   --label "sha=${SHA}" \
-  --platform linux/arm64/v8
+  --platform linux/arm64/v8 \
   --label "built_at=$(date)" \
   --label "target=dev" \
   --label "build_actor=${GITHUB_ACTOR}" \
