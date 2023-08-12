@@ -41,7 +41,7 @@ RUN /frontend-mem-nag.sh
 
 COPY superset-frontend/package*.json ./
 
-RUN PYTHON=/usr/bin/python npm ci
+RUN npm ci
 
 COPY ./superset-frontend ./
 
@@ -51,7 +51,7 @@ RUN npm run ${BUILD_CMD}
 ######################################################################
 # Final lean image...
 ######################################################################
-FROM --platform=${BUILDPLATFORM} python:${PY_VER} AS lean
+FROM python:${PY_VER} AS lean
 
 WORKDIR /app
 ENV LANG=C.UTF-8 \
