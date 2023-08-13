@@ -36,6 +36,11 @@ if [[ "${REFSPEC}" == "master" ]]; then
   LATEST_TAG="latest"
 fi
 
+DOCKER_ARGS="--load" # by default load it back
+if [[ "${DOCKER_PUSH}" == "true" ]]; then
+  DOCKER_ARGS="--push" # by default load it back
+fi
+
 
 if [ -z "${DOCKERHUB_TOKEN}" ]; then
   # Skip if secrets aren't populated -- they're only visible for actions running in the repo (not on forks)
@@ -61,65 +66,68 @@ DOCKER_BUILDKIT=1 docker buildx build --target lean \
   -t "${REPO_NAME}:${SHA}" \
   -t "${REPO_NAME}:${REFSPEC}" \
   -t "${REPO_NAME}:${LATEST_TAG}" \
-  --platform linux/arm64,linux/amd64 \
+  --platform ${BUILD_PLATFORMS} \
   --label "sha=${SHA}" \
   --label "built_at=$(date)" \
   --label "target=lean" \
   --label "build_actor=${GITHUB_ACTOR}" \
-  --push \
+  $DOCKER_ARGS \
   .
 
 #
 # Build the "lean310" image
 #
-# DOCKER_BUILDKIT=1 docker buildx build --target lean \
-#   -t "${REPO_NAME}:${SHA}-py310" \
-#   -t "${REPO_NAME}:${REFSPEC}-py310" \
-#   -t "${REPO_NAME}:${LATEST_TAG}-py310" \
-#   --build-arg PY_VER="3.10-slim"\
-#   --label "sha=${SHA}" \
-#   --platform linux/arm64,linux/amd64 \
-#   --label "built_at=$(date)" \
-#   --label "target=lean310" \
-#   --label "build_actor=${GITHUB_ACTOR}" \
-#   .
+DOCKER_BUILDKIT=1 docker buildx build --target lean \
+  -t "${REPO_NAME}:${SHA}-py310" \
+  -t "${REPO_NAME}:${REFSPEC}-py310" \
+  -t "${REPO_NAME}:${LATEST_TAG}-py310" \
+  --build-arg PY_VER="3.10-slim"\
+  --label "sha=${SHA}" \
+  --platform ${BUILD_PLATFORMS} \
+  --label "built_at=$(date)" \
+  --label "target=lean310" \
+  --label "build_actor=${GITHUB_ACTOR}" \
+  $DOCKER_ARGS \
+  .
 
 #
 # Build the "websocket" image
 #
-# DOCKER_BUILDKIT=1 docker buildx build \
-#   -t "${REPO_NAME}:${SHA}-websocket" \
-#   -t "${REPO_NAME}:${REFSPEC}-websocket" \
-#   -t "${REPO_NAME}:${LATEST_TAG}-websocket" \
-#   --label "sha=${SHA}" \
-#   --platform linux/arm64,linux/amd64 \
-#   --label "built_at=$(date)" \
-#   --label "target=websocket" \
-#   --label "build_actor=${GITHUB_ACTOR}" \
-#   superset-websocket
+DOCKER_BUILDKIT=1 docker buildx build \
+  -t "${REPO_NAME}:${SHA}-websocket" \
+  -t "${REPO_NAME}:${REFSPEC}-websocket" \
+  -t "${REPO_NAME}:${LATEST_TAG}-websocket" \
+  --label "sha=${SHA}" \
+  --platform ${BUILD_PLATFORMS} \
+  --label "built_at=$(date)" \
+  --label "target=websocket" \
+  --label "build_actor=${GITHUB_ACTOR}" \
+  $DOCKER_ARGS \
+  superset-websocket
 
 #
 # Build the dev image
 #
-# DOCKER_BUILDKIT=1 docker buildx build --target dev \
-#   -t "${REPO_NAME}:${SHA}-dev" \
-#   -t "${REPO_NAME}:${REFSPEC}-dev" \
-#   -t "${REPO_NAME}:${LATEST_TAG}-dev" \
-#   --label "sha=${SHA}" \
-#   --platform linux/arm64,linux/amd64 \
-# --output=type=docker \
-#   --label "built_at=$(date)" \
-#   --label "target=dev" \
-#   --label "build_actor=${GITHUB_ACTOR}" \
-#   .
+DOCKER_BUILDKIT=1 docker buildx build --target dev \
+  -t "${REPO_NAME}:${SHA}-dev" \
+  -t "${REPO_NAME}:${REFSPEC}-dev" \
+  -t "${REPO_NAME}:${LATEST_TAG}-dev" \
+  --label "sha=${SHA}" \
+  --platform ${BUILD_PLATFORMS} \
+  --label "built_at=$(date)" \
+  --label "target=dev" \
+  --label "build_actor=${GITHUB_ACTOR}" \
+  $DOCKER_ARGS \
+  .
 
 #
 # Build the dockerize image
 #
-# DOCKER_BUILDKIT=1 docker buildx build \
-#   -t "${REPO_NAME}:dockerize" \
-#   --label "sha=${SHA}" \
-#   --label "built_at=$(date)" \
-#   --label "build_actor=${GITHUB_ACTOR}" \
-#   -f dockerize.Dockerfile \
-#   .
+DOCKER_BUILDKIT=1 docker buildx build \
+  -t "${REPO_NAME}:dockerize" \
+  --label "sha=${SHA}" \
+  --label "built_at=$(date)" \
+  --label "build_actor=${GITHUB_ACTOR}" \
+  $DOCKER_ARGS \
+  -f dockerize.Dockerfile \
+  .

@@ -38,5 +38,7 @@ jobs:
         env:
           DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKER_PUSH: true
+          BUILD_PLATFORMS: linux/arm64,linux/amd64
         run: |
           .github/workflows/docker_build_push.sh
