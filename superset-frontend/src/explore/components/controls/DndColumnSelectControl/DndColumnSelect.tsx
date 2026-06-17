@@ -16,32 +16,27 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useCallback, useMemo, useState } from 'react';
-import {
-  AdhocColumn,
-  tn,
-  QueryFormColumn,
-  t,
-  isAdhocColumn,
-} from '@superset-ui/core';
-import {
-  ColumnMeta,
-  isColumnMeta,
-  withDndFallback,
-} from '@superset-ui/chart-controls';
+import { useCallback, useMemo, useState } from 'react';
+import { useSelector } from 'react-redux';
+import { t } from '@apache-superset/core/translation';
+import { AdhocColumn, QueryFormColumn, isAdhocColumn } from '@superset-ui/core';
+import { tn } from '@apache-superset/core/translation';
+import { ColumnMeta, isColumnMeta } from '@superset-ui/chart-controls';
 import { isEmpty } from 'lodash';
 import DndSelectLabel from 'src/explore/components/controls/DndColumnSelectControl/DndSelectLabel';
 import OptionWrapper from 'src/explore/components/controls/DndColumnSelectControl/OptionWrapper';
 import { OptionSelector } from 'src/explore/components/controls/DndColumnSelectControl/utils';
 import { DatasourcePanelDndItem } from 'src/explore/components/DatasourcePanel/types';
 import { DndItemType } from 'src/explore/components/DndItemType';
+import { ExplorePageState } from 'src/explore/types';
 import ColumnSelectPopoverTrigger from './ColumnSelectPopoverTrigger';
 import { DndControlProps } from './types';
-import SelectControl from '../SelectControl';
+import { datasetLabelLower } from 'src/features/semanticLayers/label';
 
 export type DndColumnSelectProps = DndControlProps<QueryFormColumn> & {
   options: ColumnMeta[];
   isTemporal?: boolean;
+  disabledTabs?: Set<string>;
 };
 
 function DndColumnSelect(props: DndColumnSelectProps) {
@@ -55,7 +50,21 @@ function DndColumnSelect(props: DndColumnSelectProps) {
     name,
     label,
     isTemporal,
+    disabledTabs,
   } = props;
+
+  // Semantic views do not support arbitrary SQL expressions as dimensions.
+  const datasourceType = useSelector<ExplorePageState, string | undefined>(
+    state => state.explore.datasource?.type,
+  );
+  const effectiveDisabledTabs = useMemo(
+    () =>
+      datasourceType === 'semantic_view'
+        ? new Set([...(disabledTabs ?? []), 'sqlExpression'])
+        : disabledTabs,
+    [datasourceType, disabledTabs],
+  );
+
   const [newColumnPopoverVisible, setNewColumnPopoverVisible] = useState(false);
 
   const optionSelector = useMemo(() => {
@@ -110,8 +119,13 @@ function DndColumnSelect(props: DndColumnSelectProps) {
       optionSelector.values.map((column, idx) => {
         const datasourceWarningMessage =
           isAdhocColumn(column) && column.datasourceWarning
-            ? t('This column might be incompatible with current dataset')
+            ? t(
+                'This column might be incompatible with current %s',
+                datasetLabelLower(),
+              )
             : undefined;
+        const withCaret = isAdhocColumn(column) || !column.error_text;
+
         return (
           <ColumnSelectPopoverTrigger
             key={idx}
@@ -126,6 +140,7 @@ function DndColumnSelect(props: DndColumnSelectProps) {
             }}
             editedColumn={column}
             isTemporal={isTemporal}
+            disabledTabs={effectiveDisabledTabs}
           >
             <OptionWrapper
               key={idx}
@@ -136,7 +151,7 @@ function DndColumnSelect(props: DndColumnSelectProps) {
               canDelete={canDelete}
               column={column}
               datasourceWarningMessage={datasourceWarningMessage}
-              withCaret
+              withCaret={withCaret}
             />
           </ColumnSelectPopoverTrigger>
         );
@@ -189,6 +204,9 @@ function DndColumnSelect(props: DndColumnSelectProps) {
     [ghostButtonText, multi],
   );
 
+  // Generate sortable type that matches OptionWrapper's type
+  const sortableType = `${DndItemType.ColumnOption}_${name}_${label}`;
+
   return (
     <div>
       <DndSelectLabel
@@ -199,6 +217,8 @@ function DndColumnSelect(props: DndColumnSelectProps) {
         displayGhostButton={multi || optionSelector.values.length === 0}
         ghostButtonText={labelGhostButtonText}
         onClickGhostButton={openPopover}
+        sortableType={sortableType}
+        itemCount={optionSelector.values.length}
         {...props}
       />
       <ColumnSelectPopoverTrigger
@@ -209,6 +229,7 @@ function DndColumnSelect(props: DndColumnSelectProps) {
         closePopover={closePopover}
         visible={newColumnPopoverVisible}
         isTemporal={isTemporal}
+        disabledTabs={effectiveDisabledTabs}
       >
         <div />
       </ColumnSelectPopoverTrigger>
@@ -216,9 +237,4 @@ function DndColumnSelect(props: DndColumnSelectProps) {
   );
 }
 
-const DndColumnSelectWithFallback = withDndFallback(
-  DndColumnSelect,
-  SelectControl,
-);
-
-export { DndColumnSelectWithFallback as DndColumnSelect };
+export { DndColumnSelect };

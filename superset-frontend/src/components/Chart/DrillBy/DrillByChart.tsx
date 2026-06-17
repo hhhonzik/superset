@@ -16,14 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 import {
   BaseFormData,
   QueryData,
   SuperChart,
-  css,
   ContextMenuFilters,
 } from '@superset-ui/core';
+import { css, useTheme } from '@apache-superset/core/theme';
 import { Dataset } from '../types';
 
 interface DrillByChartProps {
@@ -45,6 +45,7 @@ export default function DrillByChart({
   onContextMenu,
   inContextMenu,
 }: DrillByChartProps) {
+  const theme = useTheme();
   const hooks = useMemo(() => ({ onContextMenu }), [onContextMenu]);
 
   return (
@@ -67,6 +68,7 @@ export default function DrillByChart({
         inContextMenu={inContextMenu}
         height="100%"
         width="100%"
+        theme={theme}
       />
     </div>
   );

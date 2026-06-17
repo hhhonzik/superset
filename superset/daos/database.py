@@ -14,14 +14,33 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import logging
-from typing import Any, Optional
+from __future__ import annotations
 
-from superset.daos.base import BaseDAO
+import logging
+import re
+from typing import Any
+from urllib.parse import unquote
+
+import requests
+from flask import current_app as app
+from sqlalchemy.orm import joinedload
+
+try:
+    from odps import ODPS, options as odps_options
+    from odps.errors import BaseODPSError
+except ImportError:
+    ODPS = None
+    odps_options = None
+    BaseODPSError = None
+
+from superset import is_feature_enabled
+from superset.commands.database.ssh_tunnel.exceptions import SSHTunnelingNotEnabledError
+from superset.connectors.sqla.models import SqlaTable
+from superset.daos.base import BaseDAO, SKIP_VISIBILITY_FILTER_CLASSES
 from superset.databases.filters import DatabaseFilter
 from superset.databases.ssh_tunnel.models import SSHTunnel
 from superset.extensions import db
-from superset.models.core import Database
+from superset.models.core import Database, DatabaseUserOAuth2Tokens
 from superset.models.dashboard import Dashboard
 from superset.models.slice import Slice
 from superset.models.sql_lab import TabState
@@ -35,11 +54,65 @@ class DatabaseDAO(BaseDAO[Database]):
     base_filter = DatabaseFilter
 
     @classmethod
+    def create(
+        cls,
+        item: Database | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> Database:
+        """
+        Create a new database, with an optional SSH tunnel.
+        """
+        ssh_tunnel_attributes = (
+            attributes.pop("ssh_tunnel", None) if attributes else None
+        )
+
+        database = super().create(item, attributes)
+
+        if ssh_tunnel_attributes:
+            if not is_feature_enabled("SSH_TUNNELING"):
+                raise SSHTunnelingNotEnabledError()
+
+            database.ssh_tunnel = SSHTunnel(**ssh_tunnel_attributes)
+
+        return database
+
+    @classmethod
+    def find_by_id(
+        cls,
+        model_id: str | int,
+        skip_base_filter: bool = False,
+        id_column: str | None = None,
+        query_options: list[Any] | None = None,
+        *,
+        skip_visibility_filter: bool = False,
+    ) -> Database | None:
+        """
+        Find a database by id, eagerly loading the SSH tunnel relationship.
+        """
+        all_options = [joinedload(Database.ssh_tunnel)]
+        if query_options:
+            all_options.extend(query_options)
+        query = db.session.query(cls.model_cls).options(*all_options)
+        if skip_visibility_filter:
+            query = query.execution_options(
+                **{SKIP_VISIBILITY_FILTER_CLASSES: {cls.model_cls}}
+            )
+        query = cls._apply_base_filter(query, skip_base_filter)
+
+        column_name = id_column or cls.id_column_name
+        if not hasattr(cls.model_cls, column_name):
+            raise AttributeError(
+                "{0} has no column {1}".format(cls.model_cls, column_name)
+            )
+
+        column = getattr(cls.model_cls, column_name)
+        return query.filter(column == model_id).one_or_none()
+
+    @classmethod
     def update(
         cls,
-        model: Database,
-        properties: dict[str, Any],
-        commit: bool = True,
+        item: Database | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> Database:
         """
         Unmask ``encrypted_extra`` before updating.
@@ -49,14 +122,44 @@ class DatabaseDAO(BaseDAO[Database]):
         of the credentials.
 
         The masked values should be unmasked before the database is updated.
-        """
-        if "encrypted_extra" in properties:
-            properties["encrypted_extra"] = model.db_engine_spec.unmask_encrypted_extra(
-                model.encrypted_extra,
-                properties["encrypted_extra"],
+        """  # noqa: E501
+        attributes = attributes or {}
+
+        if item and "encrypted_extra" in attributes:
+            attributes["encrypted_extra"] = item.db_engine_spec.unmask_encrypted_extra(
+                item.encrypted_extra,
+                attributes["encrypted_extra"],
             )
 
-        return super().update(model, properties, commit)
+        # update SSH tunnel
+        if "ssh_tunnel" not in attributes:
+            # keep existing tunnel if it exists
+            ssh_tunnel = item.ssh_tunnel if item else None
+        elif attributes["ssh_tunnel"] is None:
+            # remove existing tunnel
+            ssh_tunnel = None
+        else:
+            # update existing tunnel or create a new one
+            ssh_tunnel_attributes = attributes.pop("ssh_tunnel")
+
+            # when updating the tunnel, passwords are sent masked to the frontend; if
+            # they arrive back masked we need to unmask them
+            if item and item.ssh_tunnel:
+                ssh_tunnel_attributes = unmask_password_info(
+                    ssh_tunnel_attributes,
+                    item.ssh_tunnel,
+                )
+
+                # delete existing SSH tunnel first
+                item.ssh_tunnel = None
+                db.session.flush()
+
+            ssh_tunnel = SSHTunnel(**ssh_tunnel_attributes)
+
+        database = super().update(item, attributes)
+        database.ssh_tunnel = ssh_tunnel
+
+        return database
 
     @staticmethod
     def validate_uniqueness(database_name: str) -> bool:
@@ -74,7 +177,7 @@ class DatabaseDAO(BaseDAO[Database]):
         return not db.session.query(database_query.exists()).scalar()
 
     @staticmethod
-    def get_database_by_name(database_name: str) -> Optional[Database]:
+    def get_database_by_name(database_name: str) -> Database | None:
         return (
             db.session.query(Database)
             .filter(Database.database_name == database_name)
@@ -83,13 +186,18 @@ class DatabaseDAO(BaseDAO[Database]):
 
     @staticmethod
     def build_db_for_connection_test(
-        server_cert: str, extra: str, impersonate_user: bool, encrypted_extra: str
+        server_cert: str,
+        extra: str,
+        impersonate_user: bool,
+        encrypted_extra: str,
+        ssh_tunnel: dict[str, Any] | None = None,
     ) -> Database:
         return Database(
             server_cert=server_cert,
             extra=extra,
             impersonate_user=impersonate_user,
             encrypted_extra=encrypted_extra,
+            ssh_tunnel=SSHTunnel(**ssh_tunnel) if ssh_tunnel else None,
         )
 
     @classmethod
@@ -129,34 +237,106 @@ class DatabaseDAO(BaseDAO[Database]):
         }
 
     @classmethod
-    def get_ssh_tunnel(cls, database_id: int) -> Optional[SSHTunnel]:
-        ssh_tunnel = (
-            db.session.query(SSHTunnel)
-            .filter(SSHTunnel.database_id == database_id)
-            .one_or_none()
+    def get_datasets(
+        cls,
+        database_id: int,
+        catalog: str | None,
+        schema: str | None,
+    ) -> list[SqlaTable]:
+        """
+        Return all datasets, optionally filtered by catalog/schema.
+
+        :param database_id: The database ID
+        :param catalog: The catalog name
+        :param schema: The schema name
+        :return: A list of SqlaTable objects
+        """
+        return (
+            db.session.query(SqlaTable)
+            .filter(
+                SqlaTable.database_id == database_id,
+                SqlaTable.catalog == catalog,
+                SqlaTable.schema == schema,
+            )
+            .all()
         )
 
-        return ssh_tunnel
-
-
-class SSHTunnelDAO(BaseDAO[SSHTunnel]):
     @classmethod
-    def update(
-        cls,
-        model: SSHTunnel,
-        properties: dict[str, Any],
-        commit: bool = True,
-    ) -> SSHTunnel:
+    def is_odps_partitioned_table(
+        cls, database: Database, table_name: str
+    ) -> tuple[bool, list[str]]:
         """
-        Unmask ``password``, ``private_key`` and ``private_key_password`` before updating.
-
-        When a database is edited the user sees a masked version of
-        the aforementioned fields.
-
-        The masked values should be unmasked before the ssh tunnel is updated.
+        This function is used to determine and retrieve
+        partition information of the ODPS table.
+        The return values are whether the partition
+        table is partitioned and the names of all partition fields.
         """
-        # ID cannot be updated so we remove it if present in the payload
-        properties.pop("id", None)
-        properties = unmask_password_info(properties, model)
+        if not database:
+            raise ValueError("Database not found")
+        if database.backend != "odps":
+            return False, []
+        if ODPS is None:
+            logger.warning("pyodps is not installed, cannot check ODPS partition info")
+            return False, []
+        uri = database.sqlalchemy_uri
+        access_key = database.password
+        pattern = re.compile(
+            r"odps://(?P<username>[^:]+):(?P<password>[^@]+)@(?P<project>[^/]+)/(?:\?"
+            r"endpoint=(?P<endpoint>[^&]+))"
+        )
+        if not uri or not isinstance(uri, str):
+            logger.warning(
+                "Invalid or missing sqlalchemy URI, please provide a correct URI"
+            )
+            return False, []
+        if match := pattern.match(unquote(uri)):
+            access_id = match.group("username")
+            project = match.group("project")
+            endpoint = match.group("endpoint")
+            # `get_table` is a synchronous network call. Bound it with a
+            # configurable connect/read timeout so an unreachable or slow ODPS
+            # endpoint can't block the worker indefinitely.
+            timeout = app.config["ODPS_PARTITION_DETECT_TIMEOUT"]
+            if odps_options is not None:
+                odps_options.connect_timeout = timeout
+                odps_options.read_timeout = timeout
+            try:
+                odps_client = ODPS(access_id, access_key, project, endpoint=endpoint)
+                table = odps_client.get_table(table_name)
+                if table.exist_partition:
+                    partition_spec = table.table_schema.partitions
+                    partition_fields = [partition.name for partition in partition_spec]
+                    return True, partition_fields
+                return False, []
+            except (BaseODPSError, requests.exceptions.RequestException) as ex:
+                # Network/auth/lookup failures against ODPS shouldn't break table
+                # preview; fall back to the non-partitioned path.
+                logger.warning(
+                    "Error fetching ODPS partition info for table %r: %s",
+                    table_name,
+                    ex,
+                )
+                return False, []
+        logger.warning(
+            "ODPS sqlalchemy_uri did not match the expected pattern; "
+            "unable to determine partition info for table %r",
+            table_name,
+        )
+        return False, []
 
-        return super().update(model, properties, commit)
+
+class DatabaseUserOAuth2TokensDAO(BaseDAO[DatabaseUserOAuth2Tokens]):
+    """
+    DAO for OAuth2 tokens.
+    """
+
+    @classmethod
+    def get_database(cls, database_id: int) -> Database | None:
+        """
+        Returns the database.
+
+        Note that this is different from `DatabaseDAO.find_by_id(database_id)` because
+        this DAO doesn't have any filters, so it can be called even for users without
+        database access (which is necessary for OAuth2).
+        """
+        return db.session.query(Database).filter_by(id=database_id).one_or_none()

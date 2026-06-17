@@ -19,12 +19,12 @@
 import {
   DataMaskStateWithId,
   ExtraFormData,
+  Filter,
   NativeFiltersState,
   NativeFilterType,
 } from '@superset-ui/core';
 
 export const nativeFilters: NativeFiltersState = {
-  filterSets: {},
   filters: {
     'NATIVE_FILTER-e7Q8zKixx': {
       id: 'NATIVE_FILTER-e7Q8zKixx',
@@ -49,11 +49,12 @@ export const nativeFilters: NativeFiltersState = {
         excluded: [],
       },
       controlValues: {
+        creatable: false,
         multiSelect: false,
         enableEmptyFilter: false,
         inverseSelection: false,
       },
-      type: NativeFilterType.NATIVE_FILTER,
+      type: NativeFilterType.NativeFilter,
       description: '',
       chartsInScope: [18],
     },
@@ -80,11 +81,12 @@ export const nativeFilters: NativeFiltersState = {
         excluded: [],
       },
       controlValues: {
+        creatable: false,
         multiSelect: false,
         enableEmptyFilter: false,
         inverseSelection: false,
       },
-      type: NativeFilterType.NATIVE_FILTER,
+      type: NativeFilterType.NativeFilter,
       description: '2 letter code',
       chartsInScope: [18],
     },
@@ -131,9 +133,10 @@ export const NATIVE_FILTER_ID = 'NATIVE_FILTER-p4LImrSgA';
 export const singleNativeFiltersState = {
   filters: {
     [NATIVE_FILTER_ID]: {
-      id: [NATIVE_FILTER_ID],
+      id: NATIVE_FILTER_ID,
       name: 'eth',
       type: 'text',
+      filterType: 'filter_select',
       targets: [{ datasetId: 13, column: { name: 'ethnic_minority' } }],
       defaultDataMask: {
         filterState: {
@@ -456,6 +459,25 @@ export const mockQueryDataForCountries = [
   { country_name: 'Zimbabwe', 'SUM(SP_POP_TOTL)': 509866860 },
 ];
 
+export const createSelectNativeFilter = (
+  id: string,
+  name: string,
+  column: string = name,
+): Filter => ({
+  id,
+  name,
+  type: NativeFilterType.NativeFilter,
+  filterType: 'filter_select',
+  targets: [{ datasetId: 2, column: { name: column } }],
+  defaultDataMask: { filterState: { value: null }, extraFormData: {} },
+  controlValues: {},
+  cascadeParentIds: [],
+  scope: { rootPath: ['ROOT_ID'], excluded: [] },
+  description: '',
+  chartsInScope: [],
+  tabsInScope: [],
+});
+
 export const buildNativeFilter = (
   id: string,
   name: string,
@@ -463,6 +485,7 @@ export const buildNativeFilter = (
 ) => ({
   id,
   controlValues: {
+    creatable: true,
     multiSelect: true,
     enableEmptyFilter: false,
     defaultToFirstItem: false,

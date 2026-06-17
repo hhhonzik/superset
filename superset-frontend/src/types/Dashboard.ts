@@ -24,7 +24,7 @@ export interface Dashboard {
   slug?: string | null;
   url: string;
   dashboard_title: string;
-  thumbnail_url: string;
+  thumbnail_url: string | null;
   published: boolean;
   css?: string | null;
   json_metadata?: string | null;
@@ -34,5 +34,11 @@ export interface Dashboard {
   changed_on: string;
   charts: string[]; // just chart names, unfortunately...
   owners: Owner[];
+  extra_owners?: Owner[];
   roles: Role[];
+  theme?: {
+    id: number;
+    theme_name: string;
+    json_data: string;
+  } | null;
 }

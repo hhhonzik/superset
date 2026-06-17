@@ -40,13 +40,28 @@ def left_join_df(
     return df
 
 
+def full_outer_join_df(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    lsuffix: str = "",
+    rsuffix: str = "",
+) -> pd.DataFrame:
+    df = left_df.join(right_df, lsuffix=lsuffix, rsuffix=rsuffix, how="outer")
+    df.reset_index(inplace=True)
+    return df
+
+
 def df_metrics_to_num(df: pd.DataFrame, query_object: QueryObject) -> None:
     """Converting metrics to numeric when pandas.read_sql cannot"""
     for col, dtype in df.dtypes.items():
         if dtype.type == np.object_ and col in query_object.metric_names:
-            # soft-convert a metric column to numeric
-            # will stay as strings if conversion fails
-            df[col] = df[col].infer_objects()
+            # soft-convert a metric column to numeric only if all
+            # non-null values look numeric (e.g. ClickHouse returns
+            # SUM() results as strings). Leaves truly non-numeric
+            # columns unchanged.
+            converted = pd.to_numeric(df[col], errors="coerce")
+            if converted.notna().eq(df[col].notna()).all():
+                df[col] = converted
 
 
 def is_datetime_series(series: Any) -> bool:

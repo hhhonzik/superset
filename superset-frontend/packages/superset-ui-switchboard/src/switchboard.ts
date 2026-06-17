@@ -88,7 +88,7 @@ function isError(message: Message): message is ErrorMessage {
  * Calling methods on the switchboard causes messages to be sent through the channel.
  */
 export class Switchboard {
-  port: MessagePort;
+  port!: MessagePort;
 
   name = '';
 
@@ -97,9 +97,9 @@ export class Switchboard {
   // used to make unique ids
   incrementor = 1;
 
-  debugMode: boolean;
+  debugMode = false;
 
-  private isInitialised: boolean;
+  private isInitialised = false;
 
   constructor(params?: Params) {
     if (!params) {
@@ -175,7 +175,10 @@ export class Switchboard {
   /**
    * Defines a method that can be "called" from the other side by sending an event.
    */
-  defineMethod<A = any, R = any>(methodName: string, executor: Method<A, R>) {
+  defineMethod<A extends {}, R = any>(
+    methodName: string,
+    executor: Method<A, R>,
+  ) {
     this.methods[methodName] = executor;
   }
 

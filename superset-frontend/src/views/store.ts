@@ -16,13 +16,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { configureStore, ConfigureStoreOptions, Store } from '@reduxjs/toolkit';
-import thunk from 'redux-thunk';
+import {
+  configureStore,
+  ConfigureStoreOptions,
+  createListenerMiddleware,
+  StoreEnhancer,
+} from '@reduxjs/toolkit';
+import type { AnyAction } from 'redux';
+import {
+  useDispatch,
+  useSelector,
+  type TypedUseSelectorHook,
+} from 'react-redux';
+import thunk, { type ThunkDispatch } from 'redux-thunk';
 import { api } from 'src/hooks/apiResources/queryApi';
 import messageToastReducer from 'src/components/MessageToasts/reducers';
 import charts from 'src/components/Chart/chartReducer';
 import dataMask from 'src/dataMask/reducer';
-import reports from 'src/reports/reducers/reports';
+import reports from 'src/features/reports/ReportModal/reducer';
 import dashboardInfo from 'src/dashboard/reducers/dashboardInfo';
 import dashboardState from 'src/dashboard/reducers/dashboardState';
 import dashboardFilters from 'src/dashboard/reducers/dashboardFilters';
@@ -34,12 +45,15 @@ import logger from 'src/middleware/loggerMiddleware';
 import saveModal from 'src/explore/reducers/saveModalReducer';
 import explore from 'src/explore/reducers/exploreReducer';
 import exploreDatasources from 'src/explore/reducers/datasourcesReducer';
+import { persistSqlLabStateEnhancer } from 'src/SqlLab/middlewares/persistSqlLabStateEnhancer';
+import sqlLabReducer from 'src/SqlLab/reducers/sqlLab';
+import getInitialState from 'src/SqlLab/reducers/getInitialState';
 import { DatasourcesState } from 'src/dashboard/types';
 import {
   DatasourcesActionPayload,
   DatasourcesAction,
 } from 'src/dashboard/actions/datasources';
-import shortid from 'shortid';
+import { nanoid } from 'nanoid';
 import {
   BootstrapUser,
   UndefinedUser,
@@ -49,6 +63,7 @@ import { AnyDatasourcesAction } from 'src/explore/actions/datasourcesActions';
 import { HydrateExplore } from 'src/explore/actions/hydrateExplore';
 import getBootstrapData from 'src/utils/getBootstrapData';
 import { Dataset } from '@superset-ui/chart-controls';
+import databaseReducer from 'src/database/reducers';
 
 // Some reducers don't do anything, and redux is just used to reference the initial "state".
 // This may change later, as the client application takes on more responsibilities.
@@ -66,7 +81,7 @@ export type UserLoadedAction = {
   user: UserWithPermissionsAndRoles;
 };
 
-const userReducer = (
+export const userReducer = (
   user = bootstrapData.user || {},
   action: UserLoadedAction,
 ): BootstrapUser | UndefinedUser => {
@@ -75,6 +90,8 @@ const userReducer = (
   }
   return user;
 };
+
+export const listenerMiddleware = createListenerMiddleware();
 
 const getMiddleware: ConfigureStoreOptions['middleware'] =
   getDefaultMiddleware =>
@@ -89,8 +106,8 @@ const getMiddleware: ConfigureStoreOptions['middleware'] =
             ignoredPaths: [/queryController/g],
             warnAfter: 200,
           },
-        }).concat(logger, api.middleware)
-      : [thunk, logger, api.middleware];
+        }).concat(listenerMiddleware.middleware, logger, api.middleware)
+      : [listenerMiddleware.middleware, thunk, logger, api.middleware];
 
 // TODO: This reducer is a combination of the Dashboard and Explore reducers.
 // The correct way of handling this is to unify the actions and reducers from both
@@ -100,7 +117,7 @@ const CombinedDatasourceReducers = (
   datasources: DatasourcesState | undefined | { [key: string]: Dataset },
   action: DatasourcesActionPayload | AnyDatasourcesAction | HydrateExplore,
 ) => {
-  if (action.type === DatasourcesAction.SET_DATASOURCES) {
+  if (action.type === DatasourcesAction.SetDatasources) {
     return dashboardDatasources(
       datasources as DatasourcesState | undefined,
       action as DatasourcesActionPayload,
@@ -113,10 +130,12 @@ const CombinedDatasourceReducers = (
 };
 
 const reducers = {
+  sqlLab: sqlLabReducer,
+  localStorageUsageInKilobytes: noopReducer(0),
   messageToasts: messageToastReducer,
   common: noopReducer(bootstrapData.common),
   user: userReducer,
-  impressionId: noopReducer(shortid.generate()),
+  impressionId: noopReducer(nanoid()),
   charts,
   datasources: CombinedDatasourceReducers,
   dashboardInfo,
@@ -129,9 +148,10 @@ const reducers = {
   reports,
   saveModal,
   explore,
+  database: databaseReducer,
 };
 
-/* In some cases the jinja template injects two seperate React apps into basic.html
+/* In some cases the jinja template injects two separate React apps into basic.html
  * One for the top navigation Menu and one for the application below the Menu
  * The first app to connect to the Redux debugger wins which is the menu blocking
  * the application from being able to connect to the redux debugger.
@@ -140,14 +160,14 @@ const reducers = {
  */
 export function setupStore({
   disableDebugger = false,
-  initialState = {},
+  initialState = getInitialState(bootstrapData),
   rootReducers = reducers,
   ...overrides
 }: {
   disableDebugger?: boolean;
   initialState?: ConfigureStoreOptions['preloadedState'];
   rootReducers?: ConfigureStoreOptions['reducer'];
-} & Partial<ConfigureStoreOptions> = {}): Store {
+} & Partial<ConfigureStoreOptions> = {}) {
   return configureStore({
     preloadedState: initialState,
     reducer: {
@@ -156,9 +176,27 @@ export function setupStore({
     },
     middleware: getMiddleware,
     devTools: process.env.WEBPACK_MODE === 'development' && !disableDebugger,
+    enhancers: [persistSqlLabStateEnhancer as StoreEnhancer],
     ...overrides,
   });
 }
 
-export const store: Store = setupStore();
+export const store = setupStore();
 export type RootState = ReturnType<typeof store.getState>;
+
+// Typed Redux hooks. Prefer these over the raw `useDispatch` / `useSelector`
+// from react-redux: `useAppDispatch` understands the store's middleware (so
+// thunks resolve correctly), and `useAppSelector` infers `RootState` without
+// callers having to annotate every selector. Required ahead of the
+// react-redux v8+ bump, which tightens dispatch typing — see #39927.
+//
+// AppDispatch is declared as ThunkDispatch & store.dispatch rather than
+// `typeof store.dispatch` because Superset annotates getMiddleware as
+// ConfigureStoreOptions['middleware'], which erases the middleware tuple type
+// and leaves store.dispatch typed as Dispatch<AnyAction>. The intersection
+// restores thunk support without requiring a wider refactor of the middleware
+// setup.
+export type AppDispatch = ThunkDispatch<RootState, undefined, AnyAction> &
+  typeof store.dispatch;
+export const useAppDispatch: () => AppDispatch = useDispatch;
+export const useAppSelector: TypedUseSelectorHook<RootState> = useSelector;

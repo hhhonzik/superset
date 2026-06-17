@@ -15,7 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import builtins
 from datetime import datetime
+from decimal import Decimal
+from types import ModuleType
 from typing import Any, Optional
 from unittest.mock import Mock, patch
 
@@ -33,14 +36,14 @@ from sqlalchemy.dialects.mysql import (
     TINYINT,
     TINYTEXT,
 )
-from sqlalchemy.engine.url import make_url, URL
+from sqlalchemy.engine.url import make_url, URL  # noqa: F401
 
 from superset.utils.core import GenericDataType
 from tests.unit_tests.db_engine_specs.utils import (
     assert_column_spec,
     assert_convert_dttm,
 )
-from tests.unit_tests.fixtures.common import dttm
+from tests.unit_tests.fixtures.common import dttm  # noqa: F401
 
 
 @pytest.mark.parametrize(
@@ -76,7 +79,7 @@ def test_get_column_spec(
     generic_type: GenericDataType,
     is_dttm: bool,
 ) -> None:
-    from superset.db_engine_specs.mysql import MySQLEngineSpec as spec
+    from superset.db_engine_specs.mysql import MySQLEngineSpec as spec  # noqa: N813
 
     assert_column_spec(spec, native_type, sqla_type, attrs, generic_type, is_dttm)
 
@@ -93,9 +96,11 @@ def test_get_column_spec(
     ],
 )
 def test_convert_dttm(
-    target_type: str, expected_result: Optional[str], dttm: datetime
+    target_type: str,
+    expected_result: Optional[str],
+    dttm: datetime,  # noqa: F811
 ) -> None:
-    from superset.db_engine_specs.mysql import MySQLEngineSpec as spec
+    from superset.db_engine_specs.mysql import MySQLEngineSpec as spec  # noqa: N813
 
     assert_convert_dttm(spec, target_type, expected_result, dttm)
 
@@ -116,7 +121,7 @@ def test_validate_database_uri(sqlalchemy_uri: str, error: bool) -> None:
 
     url = make_url(sqlalchemy_uri)
     if error:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError):  # noqa: PT011
             MySQLEngineSpec.validate_database_uri(url)
         return
     MySQLEngineSpec.validate_database_uri(url)
@@ -220,3 +225,81 @@ def test_get_schema_from_engine_params() -> None:
         )
         == "db1"
     )
+
+
+@pytest.mark.parametrize(
+    "data,description,expected_result",
+    [
+        (
+            [("1.23456", "abc")],
+            [("dec", "decimal(12,6)"), ("str", "varchar(3)")],
+            [(Decimal("1.23456"), "abc")],
+        ),
+        (
+            [(Decimal("1.23456"), "abc")],
+            [("dec", "decimal(12,6)"), ("str", "varchar(3)")],
+            [(Decimal("1.23456"), "abc")],
+        ),
+        (
+            [(None, "abc")],
+            [("dec", "decimal(12,6)"), ("str", "varchar(3)")],
+            [(None, "abc")],
+        ),
+        (
+            [("1.23456", "abc")],
+            [("dec", "varchar(255)"), ("str", "varchar(3)")],
+            [("1.23456", "abc")],
+        ),
+    ],
+)
+def test_column_type_mutator(
+    data: list[tuple[Any, ...]],
+    description: list[Any],
+    expected_result: list[tuple[Any, ...]],
+):
+    from superset.db_engine_specs.mysql import MySQLEngineSpec as spec  # noqa: N813
+
+    mock_cursor = Mock()
+    mock_cursor.fetchall.return_value = data
+    mock_cursor.description = description
+
+    assert spec.fetch_data(mock_cursor) == expected_result
+
+
+def test_get_datatype_pymysql_fallback():
+    """get_datatype() falls back to pymysql when MySQLdb is not installed."""
+    from superset.db_engine_specs.mysql import MySQLEngineSpec
+
+    # Reset cached type_code_map so the import path is exercised
+    original_type_code_map = MySQLEngineSpec.type_code_map
+    MySQLEngineSpec.type_code_map = {}
+
+    try:
+        # Build a fake pymysql module with constants.FIELD_TYPE
+        fake_field_type = ModuleType("pymysql.constants.FIELD_TYPE")
+        fake_field_type.TINY = 1
+        fake_field_type.VARCHAR = 15
+
+        fake_constants = ModuleType("pymysql.constants")
+        fake_constants.FIELD_TYPE = fake_field_type
+
+        fake_pymysql = ModuleType("pymysql")
+        fake_pymysql.constants = fake_constants
+
+        original_import = builtins.__import__
+
+        def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "MySQLdb":
+                raise ImportError("No module named 'MySQLdb'")
+            if name == "pymysql":
+                return fake_pymysql
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            assert MySQLEngineSpec.get_datatype(1) == "TINY"
+            assert MySQLEngineSpec.get_datatype(15) == "VARCHAR"
+            assert MySQLEngineSpec.get_datatype("BIGINT") == "BIGINT"
+            assert MySQLEngineSpec.get_datatype(999) is None
+    finally:
+        # Restore original state
+        MySQLEngineSpec.type_code_map = original_type_code_map

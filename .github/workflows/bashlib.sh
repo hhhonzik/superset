@@ -20,29 +20,11 @@ set -e
 GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-.}
 ASSETS_MANIFEST="$GITHUB_WORKSPACE/superset/static/assets/manifest.json"
 
-# Rounded job start time, used to create a unique Cypress build id for
-# parallelization so we can manually rerun a job after 20 minutes
-NONCE=$(echo "$(date "+%Y%m%d%H%M") - ($(date +%M)%20)" | bc)
-
 # Echo only when not in parallel mode
 say() {
   if [[ $(echo "$INPUT_PARALLEL" | tr '[:lower:]' '[:upper:]') != 'TRUE' ]]; then
     echo "$1"
   fi
-}
-
-# default command to run when the `run` input is empty
-default-setup-command() {
-  apt-get-install
-  pip-upgrade
-}
-
-apt-get-install() {
-  say "::group::apt-get install dependencies"
-  sudo apt-get update && sudo apt-get install --yes \
-    libsasl2-dev \
-    libldap2-dev
-  say "::endgroup::"
 }
 
 pip-upgrade() {
@@ -69,6 +51,15 @@ build-assets() {
   cd "$GITHUB_WORKSPACE/superset-frontend"
 
   say "::group::Build static assets"
+  npm run build
+  say "::endgroup::"
+}
+
+build-embedded-sdk() {
+  cd "$GITHUB_WORKSPACE/superset-embedded-sdk"
+
+  say "::group::Build embedded SDK bundle for E2E tests"
+  npm ci
   npm run build
   say "::endgroup::"
 }
@@ -103,6 +94,8 @@ EOF
 setup-mysql() {
   say "::group::Initialize database"
   mysql -h 127.0.0.1 -P 13306 -u root --password=root <<-EOF
+    SET GLOBAL transaction_isolation='READ-COMMITTED';
+    SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED;
     DROP DATABASE IF EXISTS superset;
     CREATE DATABASE superset DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci;
     DROP DATABASE IF EXISTS sqllab_test_db;
@@ -129,9 +122,44 @@ testdata() {
   say "::endgroup::"
 }
 
-codecov() {
-  say "::group::Upload code coverage"
-  bash ".github/workflows/codecov.sh" "$@"
+playwright_testdata() {
+  cd "$GITHUB_WORKSPACE"
+  say "::group::Load all examples for Playwright tests"
+  # must specify PYTHONPATH to make `tests.superset_test_config` importable
+  export PYTHONPATH="$GITHUB_WORKSPACE"
+  pip install -e .
+  superset db upgrade
+  superset load_test_users
+  superset load_examples
+  superset init
+  # Enable DML on the examples database so Playwright tests can create/drop
+  # temporary tables via SQL Lab without depending on external data sources.
+  superset shell <<'PYEOF'
+import sys
+from superset.extensions import db
+from superset.models.core import Database
+examples_db = db.session.query(Database).filter_by(database_name='examples').first()
+if not examples_db:
+    sys.exit('ERROR: examples database not found. load_examples may have failed.')
+
+examples_db.allow_dml = True
+db.session.commit()
+print('Enabled allow_dml on examples database')
+PYEOF
+  say "::endgroup::"
+}
+
+celery-worker() {
+  cd "$GITHUB_WORKSPACE"
+  say "::group::Start Celery worker"
+  # must specify PYTHONPATH to make `tests.superset_test_config` importable
+  export PYTHONPATH="$GITHUB_WORKSPACE"
+  celery \
+    --app=superset.tasks.celery_app:app \
+    worker \
+      --concurrency=2 \
+      --detach \
+      --optimization=fair
   say "::endgroup::"
 }
 
@@ -147,71 +175,196 @@ cypress-install() {
   cache-save cypress
 }
 
-# Run Cypress and upload coverage reports
-cypress-run() {
+cypress-run-all() {
+  local USE_DASHBOARD=$1
+  local APP_ROOT=$2
   cd "$GITHUB_WORKSPACE/superset-frontend/cypress-base"
 
-  local page=$1
-  local group=${2:-Default}
-  local cypress="./node_modules/.bin/cypress run"
-  local browser=${CYPRESS_BROWSER:-chrome}
+  # Start the Superset backend via gunicorn (not `flask run`). The Flask
+  # development server is single-threaded and has no crash-recovery, so
+  # heavy tests (dashboard import/export, SQL Lab) can knock it offline
+  # for the rest of the run — surfacing as `ECONNREFUSED` / `socket hang up`
+  # / `Missing CSRF token` cascades. Gunicorn gives us multiple workers,
+  # a request timeout, and worker-recycling under load.
+  local serverlog="${HOME}/superset-cypress.log"
+  local port=8081
+  CYPRESS_BASE_URL="http://localhost:${port}"
+  if [ -n "$APP_ROOT" ]; then
+    export SUPERSET_APP_ROOT=$APP_ROOT
+    CYPRESS_BASE_URL=${CYPRESS_BASE_URL}${APP_ROOT}
+  fi
+  export CYPRESS_BASE_URL
 
-  export TERM="xterm"
+  # Mirrors the args in docker/entrypoints/run-server.sh (1 worker × 20
+  # gthread threads) to keep parity with production. Multi-worker
+  # configurations expose timing-sensitive races in the SQL Lab → Explore
+  # navigation flow under E2E. We diverge from the entrypoint on:
+  #   --timeout 120: heavy dashboard import/export specs exceed the 60s
+  #     default
+  #   --max-requests / --max-requests-jitter: recycle the worker under
+  #     test load to avoid leaks accumulating across the run
+  #   superset.app:create_app(): explicit factory so we don't depend on
+  #     FLASK_APP being exported
+  nohup gunicorn \
+    --bind "127.0.0.1:$port" \
+    --workers 1 \
+    --worker-class gthread \
+    --threads 20 \
+    --timeout 120 \
+    --max-requests 500 \
+    --max-requests-jitter 50 \
+    --access-logfile - \
+    --error-logfile - \
+    "superset.app:create_app()" \
+    >"$serverlog" 2>&1 </dev/null &
+  local serverPid=$!
 
-  say "::group::Run Cypress for [$page]"
-  if [[ -z $CYPRESS_KEY ]]; then
-    $cypress --spec "cypress/e2e/$page" --browser "$browser"
-  else
-    export CYPRESS_RECORD_KEY=$(echo $CYPRESS_KEY | base64 --decode)
-    # additional flags for Cypress dashboard recording
-    $cypress --spec "cypress/e2e/$page" --browser "$browser" \
-      --record --group "$group" --tag "${GITHUB_REPOSITORY},${GITHUB_EVENT_NAME}" \
-      --parallel --ci-build-id "${GITHUB_SHA:0:8}-${NONCE}"
+  # Ensure the backend is cleaned up and its log is emitted even when the
+  # test runner fails under `set -e`.
+  trap '
+    echo "::group::gunicorn log for Cypress run"
+    cat "'"$serverlog"'" || true
+    echo "::endgroup::"
+    kill '"$serverPid"' 2>/dev/null || true
+  ' EXIT
+
+  # Wait for the backend to be ready before launching Cypress; otherwise
+  # the first spec can race the server bind and see connection errors.
+  local timeout=60
+  say "Waiting for gunicorn server to start on port $port..."
+  while [ $timeout -gt 0 ]; do
+    if curl -f "http://localhost:${port}${APP_ROOT}/health" >/dev/null 2>&1; then
+      say "gunicorn server is ready"
+      break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+  done
+  if [ $timeout -eq 0 ]; then
+    echo "::error::gunicorn server failed to start within 60 seconds"
+    echo "::group::Server startup log"
+    cat "$serverlog"
+    echo "::endgroup::"
+    return 1
   fi
 
-  # don't add quotes to $record because we do want word splitting
+  USE_DASHBOARD_FLAG=''
+  if [ "$USE_DASHBOARD" = "true" ]; then
+    USE_DASHBOARD_FLAG='--use-dashboard'
+  fi
+
+  # UNCOMMENT the next few commands to monitor memory usage
+  # monitor_memory &  # Start memory monitoring in the background
+  # memoryMonitorPid=$!
+  python ../../scripts/cypress_run.py --parallelism $PARALLELISM --parallelism-id $PARALLEL_ID --group $PARALLEL_ID --retries 5 $USE_DASHBOARD_FLAG
+  # kill $memoryMonitorPid
+}
+
+playwright-install() {
+  cd "$GITHUB_WORKSPACE/superset-frontend"
+
+  say "::group::Install Playwright browsers"
+  npx playwright install --with-deps chromium
+  # Create output directories for test results and debugging
+  mkdir -p playwright-results
+  mkdir -p test-results
   say "::endgroup::"
 }
 
-cypress-run-all() {
-  # Start Flask and run it in background
-  # --no-debugger means disable the interactive debugger on the 500 page
-  # so errors can print to stderr.
-  local flasklog="${HOME}/flask.log"
+playwright-run() {
+  local APP_ROOT=$1
+  local TEST_PATH=$2
+
+  # Start the Superset backend via gunicorn from the project root.
+  # See cypress-run-all() above for the rationale — the Flask dev server
+  # cannot survive the dashboard import/export tests under load.
+  cd "$GITHUB_WORKSPACE"
+  local serverlog="${HOME}/superset-playwright.log"
   local port=8081
-  export CYPRESS_BASE_URL="http://localhost:${port}"
+  # Use 127.0.0.1 explicitly: `flask run` binds IPv4 only, and Node's DNS
+  # resolution for `localhost` can return `::1` first (IPv6), which then
+  # refuses against the IPv4 listener and surfaces as
+  # `connect ECONNREFUSED ::1:<port>` in API helpers driven from Node
+  # (e.g., the embedded test app's exposed token fetcher).
+  PLAYWRIGHT_BASE_URL="http://127.0.0.1:${port}"
+  if [ -n "$APP_ROOT" ]; then
+    export SUPERSET_APP_ROOT=$APP_ROOT
+    PLAYWRIGHT_BASE_URL=${PLAYWRIGHT_BASE_URL}${APP_ROOT}/
+  fi
+  export PLAYWRIGHT_BASE_URL
 
-  nohup flask run --no-debugger -p $port >"$flasklog" 2>&1 </dev/null &
-  local flaskProcessId=$!
+  # See cypress-run-all() above for the args rationale (1 worker × 20
+  # gthread threads matching docker/entrypoints/run-server.sh, plus a
+  # 120s timeout and request-recycling for heavy E2E load).
+  nohup gunicorn \
+    --bind "127.0.0.1:$port" \
+    --workers 1 \
+    --worker-class gthread \
+    --threads 20 \
+    --timeout 120 \
+    --max-requests 500 \
+    --max-requests-jitter 50 \
+    --access-logfile - \
+    --error-logfile - \
+    "superset.app:create_app()" \
+    >"$serverlog" 2>&1 </dev/null &
+  local serverPid=$!
 
-  cypress-run "*/**/*"
+  # Ensure cleanup on exit (and emit the server log on failure)
+  trap '
+    echo "::group::gunicorn log for Playwright run"
+    cat "'"$serverlog"'" || true
+    echo "::endgroup::"
+    kill '"$serverPid"' 2>/dev/null || true
+  ' EXIT
 
-  # After job is done, print out Flask log for debugging
-  say "::group::Flask log for default run"
-  cat "$flasklog"
+  # Wait for server to be ready with health check
+  local timeout=60
+  say "Waiting for gunicorn server to start on port $port..."
+  while [ $timeout -gt 0 ]; do
+    if curl -f ${PLAYWRIGHT_BASE_URL}/health >/dev/null 2>&1; then
+      say "gunicorn server is ready"
+      break
+    fi
+    sleep 1
+    timeout=$((timeout - 1))
+  done
+
+  if [ $timeout -eq 0 ]; then
+    echo "::error::gunicorn server failed to start within 60 seconds"
+    echo "::group::Server startup log"
+    cat "$serverlog"
+    echo "::endgroup::"
+    return 1
+  fi
+
+  # Change to frontend directory for Playwright execution
+  cd "$GITHUB_WORKSPACE/superset-frontend"
+
+  say "::group::Run Playwright tests"
+  echo "Running Playwright with baseURL: ${PLAYWRIGHT_BASE_URL}"
+  if [ -n "$TEST_PATH" ]; then
+    # Check if there are any test files in the specified path
+    if ! find "playwright/tests/${TEST_PATH}" -name "*.spec.ts" -type f 2>/dev/null | grep -q .; then
+      echo "No test files found in ${TEST_PATH} - skipping test run"
+      say "::endgroup::"
+      return 0
+    fi
+    echo "Running tests: ${TEST_PATH}"
+    # Set INCLUDE_EXPERIMENTAL=true to allow experimental tests to run
+    export INCLUDE_EXPERIMENTAL=true
+    npx playwright test "${TEST_PATH}" --output=playwright-results
+    local status=$?
+    # Unset to prevent leaking into subsequent commands
+    unset INCLUDE_EXPERIMENTAL
+  else
+    echo "Running all required tests (experimental/ excluded via playwright.config.ts)"
+    npx playwright test --output=playwright-results
+    local status=$?
+  fi
   say "::endgroup::"
 
-  # Rerun SQL Lab tests with backend persist disabled
-  export SUPERSET_CONFIG=tests.integration_tests.superset_test_config_sqllab_backend_persist_off
-
-  # Restart Flask with new configs
-  kill $flaskProcessId
-  nohup flask run --no-debugger -p $port >"$flasklog" 2>&1 </dev/null &
-  local flaskProcessId=$!
-
-  cypress-run "sqllab/*" "Backend persist"
-
-  # Upload code coverage separately so each page can have separate flags
-  # -c will clean existing coverage reports, -F means add flags
-  # || true to prevent CI failure on codecov upload
-  codecov -c -F "cypress" || true
-
-  say "::group::Flask log for backend persist"
-  cat "$flasklog"
-  say "::endgroup::"
-
-  # make sure the program exits
-  kill $flaskProcessId
+  return $status
 }
 
 eyes-storybook-dependencies() {
@@ -220,27 +373,17 @@ eyes-storybook-dependencies() {
   say "::endgroup::"
 }
 
-cypress-run-applitools() {
-  cd "$GITHUB_WORKSPACE/superset-frontend/cypress-base"
-
-  local flasklog="${HOME}/flask.log"
-  local port=8081
-  local cypress="./node_modules/.bin/cypress run"
-  local browser=${CYPRESS_BROWSER:-chrome}
-
-  export CYPRESS_BASE_URL="http://localhost:${port}"
-
-  nohup flask run --no-debugger -p $port >"$flasklog" 2>&1 </dev/null &
-  local flaskProcessId=$!
-
-  $cypress --spec "cypress/e2e/*/**/*.applitools.test.ts" --browser "$browser" --headless --config ignoreTestFiles="[]"
-
-  codecov -c -F "cypress" || true
-
-  say "::group::Flask log for default run"
-  cat "$flasklog"
-  say "::endgroup::"
-
-  # make sure the program exits
-  kill $flaskProcessId
+monitor_memory() {
+  # This is a small utility to monitor memory usage. Useful for debugging memory in GHA.
+  # To use wrap your command as follows
+  #
+  # monitor_memory &  # Start memory monitoring in the background
+  # memoryMonitorPid=$!
+  # YOUR_COMMAND_HERE
+  # kill $memoryMonitorPid
+  while true; do
+    echo "$(date) - Top 5 memory-consuming processes:"
+    ps -eo pid,comm,%mem --sort=-%mem | head -n 6  # First line is the header, next 5 are top processes
+    sleep 2
+  done
 }

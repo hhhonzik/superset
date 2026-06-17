@@ -18,7 +18,13 @@ import logging
 from typing import Any, Optional
 
 from flask import request, Response
-from flask_appbuilder.api import expose, permission_name, protect, rison, safe
+from flask_appbuilder.api import (
+    expose,
+    permission_name,
+    protect,
+    rison as parse_rison,
+    safe,
+)
 from flask_appbuilder.hooks import before_request
 from flask_appbuilder.models.sqla.interface import SQLAInterface
 from flask_babel import ngettext
@@ -26,13 +32,9 @@ from marshmallow import ValidationError
 
 from superset import is_feature_enabled
 from superset.charts.filters import ChartFilter
-from superset.constants import MODEL_API_RW_METHOD_PERMISSION_MAP, RouteMethod
-from superset.dashboards.filters import DashboardAccessFilter
-from superset.databases.filters import DatabaseFilter
-from superset.extensions import event_logger
-from superset.reports.commands.create import CreateReportScheduleCommand
-from superset.reports.commands.delete import DeleteReportScheduleCommand
-from superset.reports.commands.exceptions import (
+from superset.commands.report.create import CreateReportScheduleCommand
+from superset.commands.report.delete import DeleteReportScheduleCommand
+from superset.commands.report.exceptions import (
     ReportScheduleCreateFailedError,
     ReportScheduleDeleteFailedError,
     ReportScheduleForbiddenError,
@@ -40,15 +42,23 @@ from superset.reports.commands.exceptions import (
     ReportScheduleNotFoundError,
     ReportScheduleUpdateFailedError,
 )
-from superset.reports.commands.update import UpdateReportScheduleCommand
+from superset.commands.report.update import UpdateReportScheduleCommand
+from superset.constants import MODEL_API_RW_METHOD_PERMISSION_MAP, RouteMethod
+from superset.dashboards.filters import DashboardAccessFilter
+from superset.databases.filters import DatabaseFilter
+from superset.exceptions import SupersetException
+from superset.extensions import event_logger
 from superset.reports.filters import ReportScheduleAllTextFilter, ReportScheduleFilter
-from superset.reports.models import ReportSchedule
+from superset.reports.models import ReportCreationMethod, ReportSchedule
 from superset.reports.schemas import (
     get_delete_ids_schema,
+    get_slack_channels_schema,
     openapi_spec_methods_override,
     ReportSchedulePostSchema,
     ReportSchedulePutSchema,
+    ReportScheduleSubscribeSchema,
 )
+from superset.utils.slack import get_channels_with_search
 from superset.views.base_api import (
     BaseSupersetModelRestApi,
     RelatedFieldFilter,
@@ -71,12 +81,19 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
 
     include_route_methods = RouteMethod.REST_MODEL_VIEW_CRUD_SET | {
         RouteMethod.RELATED,
-        "bulk_delete",  # not using RouteMethod since locally defined
+        "bulk_delete",
+        "slack_channels",  # not using RouteMethod since locally defined
+        "subscribe",
     }
     class_permission_name = "ReportSchedule"
     method_permission_name = MODEL_API_RW_METHOD_PERMISSION_MAP
     resource_name = "report"
     allow_browser_login = True
+
+    extra_fields_rel_fields = {
+        **BaseSupersetModelRestApi.extra_fields_rel_fields,
+        "created_by": ["email", "active"],
+    }
 
     base_filters = [
         ["id", ReportScheduleFilter, lambda: []],
@@ -109,6 +126,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "owners.first_name",
         "owners.id",
         "owners.last_name",
+        "owners.email",
         "recipients.id",
         "recipients.recipient_config_json",
         "recipients.type",
@@ -119,6 +137,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "validator_config_json",
         "validator_type",
         "working_timeout",
+        "email_subject",
     ]
     show_select_columns = show_columns + [
         "chart.datasource_id",
@@ -147,6 +166,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "owners.first_name",
         "owners.id",
         "owners.last_name",
+        "owners.email",
         "recipients.id",
         "recipients.type",
         "timezone",
@@ -180,6 +200,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
     edit_columns = add_columns
     add_model_schema = ReportSchedulePostSchema()
     edit_model_schema = ReportSchedulePutSchema()
+    subscribe_schema = ReportScheduleSubscribeSchema()
 
     order_columns = [
         "active",
@@ -198,6 +219,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
     search_columns = [
         "name",
         "active",
+        "changed_by",
         "created_by",
         "owners",
         "type",
@@ -207,7 +229,14 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "chart_id",
     ]
     search_filters = {"name": [ReportScheduleAllTextFilter]}
-    allowed_rel_fields = {"owners", "chart", "dashboard", "database", "created_by"}
+    allowed_rel_fields = {
+        "owners",
+        "chart",
+        "dashboard",
+        "database",
+        "created_by",
+        "changed_by",
+    }
 
     base_related_field_filters = {
         "chart": [["id", ChartFilter, lambda: []]],
@@ -215,6 +244,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "database": [["id", DatabaseFilter, lambda: []]],
         "owners": [["id", BaseFilterRelatedUsers, lambda: []]],
         "created_by": [["id", BaseFilterRelatedUsers, lambda: []]],
+        "changed_by": [["id", BaseFilterRelatedUsers, lambda: []]],
     }
     text_field_rel_fields = {
         "dashboard": "dashboard_title",
@@ -226,6 +256,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "chart": "slice_name",
         "database": "database_name",
         "created_by": RelatedFieldFilter("first_name", FilterRelatedOwners),
+        "changed_by": RelatedFieldFilter("first_name", FilterRelatedOwners),
         "owners": RelatedFieldFilter("first_name", FilterRelatedOwners),
     }
 
@@ -284,6 +315,80 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         except ReportScheduleDeleteFailedError as ex:
             logger.error(
                 "Error deleting report schedule %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
+            )
+            return self.response_422(message=str(ex))
+
+    @expose("/subscribe", methods=("POST",))
+    @protect()
+    @statsd_metrics
+    @permission_name("subscribe")
+    @requires_json
+    def subscribe(self) -> Response:
+        """Subscribe the current user to a chart or dashboard report.
+        ---
+        post:
+          summary: Subscribe to a chart or dashboard report
+          description: >-
+            Creates a report schedule locked to the authenticated user's email.
+            ``creation_method`` is derived server-side from the payload
+            (chart → charts, dashboard → dashboards). ``recipients`` are not
+            accepted and are always set to the requesting user's email address.
+          requestBody:
+            description: Report schedule subscription schema
+            required: true
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/{{self.__class__.__name__}}.post'
+          responses:
+            201:
+              description: Report schedule subscription created
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      id:
+                        type: number
+                      result:
+                        $ref: '#/components/schemas/{{self.__class__.__name__}}.post'
+            400:
+              $ref: '#/components/responses/400'
+            401:
+              $ref: '#/components/responses/401'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            item = self.subscribe_schema.load(request.json)
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+
+        # Derive creation_method server-side from the payload
+        if item.get("dashboard") is not None:
+            item["creation_method"] = ReportCreationMethod.DASHBOARDS
+        elif item.get("chart") is not None:
+            item["creation_method"] = ReportCreationMethod.CHARTS
+        else:
+            return self.response_400(
+                message={"_schema": ["Either chart or dashboard is required"]}
+            )
+
+        try:
+            new_model = CreateReportScheduleCommand(item).run()
+            return self.response(201, id=new_model.id, result=item)
+        except ReportScheduleNotFoundError as ex:
+            return self.response_400(message=str(ex))
+        except ReportScheduleInvalidError as ex:
+            return self.response_422(message=ex.normalized_messages())
+        except ReportScheduleCreateFailedError as ex:
+            logger.error(
+                "Error creating report schedule %s: %s",
                 self.__class__.__name__,
                 str(ex),
                 exc_info=True,
@@ -449,7 +554,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
     @protect()
     @safe
     @statsd_metrics
-    @rison(get_delete_ids_schema)
+    @parse_rison(get_delete_ids_schema)
     @event_logger.log_this_with_context(
         action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.bulk_delete",
         log_to_statsd=False,
@@ -503,4 +608,73 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         except ReportScheduleForbiddenError:
             return self.response_403()
         except ReportScheduleDeleteFailedError as ex:
+            return self.response_422(message=str(ex))
+
+    @expose("/slack_channels/", methods=("GET",))
+    @protect()
+    @parse_rison(get_slack_channels_schema)
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self,
+        *args,
+        **kwargs: f"{self.__class__.__name__}.slack_channels",
+        log_to_statsd=False,
+    )
+    def slack_channels(self, **kwargs: Any) -> Response:
+        """Get slack channels.
+        ---
+        get:
+          summary: Get slack channels
+          description: Get slack channels
+          parameters:
+            - in: query
+              name: q
+              content:
+                application/json:
+                  schema:
+                    $ref: '#/components/schemas/get_slack_channels_schema'
+          responses:
+            200:
+              description: Slack channels
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      result:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            name:
+                              type: string
+            401:
+              $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            422:
+              $ref: '#/components/responses/422'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            params = kwargs.get("rison", {})
+            search_string = params.get("search_string")
+            types = params.get("types", [])
+            exact_match = params.get("exact_match", False)
+            force = params.get("force", False)
+            channels = get_channels_with_search(
+                search_string=search_string,
+                types=types,
+                exact_match=exact_match,
+                force=force,
+            )
+            return self.response(200, result=channels)
+        except SupersetException as ex:
+            logger.error("Error fetching slack channels %s", str(ex))
             return self.response_422(message=str(ex))

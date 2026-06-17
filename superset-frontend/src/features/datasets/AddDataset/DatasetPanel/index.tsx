@@ -16,10 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useEffect, useState, useRef } from 'react';
-import { SupersetClient, logging, t } from '@superset-ui/core';
+import { useEffect, useState, useRef } from 'react';
+import { t } from '@apache-superset/core/translation';
+import { SupersetClient } from '@superset-ui/core';
+import { logging } from '@apache-superset/core/utils';
 import { DatasetObject } from 'src/features/datasets/AddDataset/types';
 import { addDangerToast } from 'src/components/MessageToasts/actions';
+import { type DatabaseObject } from 'src/components';
+import { toQueryString } from 'src/utils/urlUtils';
 import DatasetPanel from './DatasetPanel';
 import { ITableColumn, IDatabaseTable, isIDatabaseTable } from './types';
 
@@ -36,9 +40,9 @@ interface IColumnProps {
    */
   tableName: string;
   /**
-   * Name of the schema
+   * Name of the schema (optional for databases that don't support schemas)
    */
-  schema: string;
+  schema?: string | null;
 }
 
 export interface IDatasetPanelWrapperProps {
@@ -51,9 +55,14 @@ export interface IDatasetPanelWrapperProps {
    */
   dbId?: number;
   /**
-   * The selected schema for the database
+   * The selected catalog/schema for the database
    */
+  catalog?: string | null;
   schema?: string | null;
+  /**
+   * The selected database object (used to check engine capabilities)
+   */
+  database?: Partial<DatabaseObject> | null;
   setHasColumns?: Function;
   datasets?: DatasetObject[] | undefined;
 }
@@ -61,7 +70,9 @@ export interface IDatasetPanelWrapperProps {
 const DatasetPanelWrapper = ({
   tableName,
   dbId,
+  catalog,
   schema,
+  database,
   setHasColumns,
   datasets,
 }: IDatasetPanelWrapperProps) => {
@@ -74,7 +85,11 @@ const DatasetPanelWrapper = ({
     const { dbId, tableName, schema } = props;
     setLoading(true);
     setHasColumns?.(false);
-    const path = `/api/v1/database/${dbId}/table/${tableName}/${schema}/`;
+    const path = `/api/v1/database/${dbId}/table_metadata/${toQueryString({
+      name: tableName,
+      catalog,
+      schema,
+    })}`;
     try {
       const response = await SupersetClient.get({
         endpoint: path,
@@ -119,12 +134,13 @@ const DatasetPanelWrapper = ({
 
   useEffect(() => {
     tableNameRef.current = tableName;
-    if (tableName && schema && dbId) {
-      getTableMetadata({ tableName, dbId, schema });
+    const schemaRequired = database?.supports_schemas !== false;
+    if (tableName && dbId && (schema || !schemaRequired)) {
+      getTableMetadata({ tableName, dbId, schema: schema || undefined });
     }
     // getTableMetadata is a const and should not be in dependency array
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tableName, dbId, schema]);
+  }, [tableName, dbId, schema, database]);
 
   return (
     <DatasetPanel

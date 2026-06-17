@@ -17,25 +17,42 @@
  * under the License.
  */
 import { useMemo } from 'react';
-import { useSelector } from 'react-redux';
-import {
-  DataMaskStateWithId,
-  ensureIsArray,
-  ExtraFormData,
-} from '@superset-ui/core';
+import { shallowEqual, useSelector } from 'react-redux';
+import { DataMaskStateWithId, ExtraFormData } from '@superset-ui/core';
+import { RootState } from 'src/dashboard/types';
 import { mergeExtraFormData } from '../../utils';
+import {
+  FilterConfigMap,
+  resolveTransitiveParentIds,
+} from '../../dependencyGraph';
 
-// eslint-disable-next-line import/prefer-default-export
+/**
+ * Resolve the transitive ancestor ids for a given filter from the live
+ * native-filter configuration in Redux. Shared between
+ * `useFilterDependencies` and the readiness guard in `FilterValue` so they
+ * always agree on which parents count.
+ */
+export function useTransitiveParentIds(id: string): string[] {
+  const filterConfig = useSelector<RootState, FilterConfigMap | undefined>(
+    state => state.nativeFilters?.filters,
+    shallowEqual,
+  );
+
+  return useMemo(
+    () => resolveTransitiveParentIds(id, filterConfig ?? {}),
+    [id, filterConfig],
+  );
+}
+
 export function useFilterDependencies(
   id: string,
   dataMaskSelected?: DataMaskStateWithId,
 ): ExtraFormData {
-  const dependencyIds = useSelector<any, string[] | undefined>(
-    state => state.nativeFilters.filters[id]?.cascadeParentIds,
-  );
+  const dependencyIds = useTransitiveParentIds(id);
+
   return useMemo(() => {
-    let dependencies = {};
-    ensureIsArray(dependencyIds).forEach(parentId => {
+    let dependencies: ExtraFormData = {};
+    dependencyIds.forEach(parentId => {
       const parentState = dataMaskSelected?.[parentId];
       dependencies = mergeExtraFormData(
         dependencies,

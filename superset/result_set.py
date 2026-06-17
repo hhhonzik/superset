@@ -14,10 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-""" Superset wrapper around pyarrow.Table.
-"""
+"""Superset wrapper around pyarrow.Table."""
+
 import datetime
-import json
 import logging
 from typing import Any, Optional
 
@@ -28,12 +27,13 @@ from numpy.typing import NDArray
 
 from superset.db_engine_specs import BaseEngineSpec
 from superset.superset_typing import DbapiDescription, DbapiResult, ResultSetColumnType
-from superset.utils import core as utils
+from superset.utils import core as utils, json
+from superset.utils.core import GenericDataType
 
 logger = logging.getLogger(__name__)
 
 
-def dedup(l: list[str], suffix: str = "__", case_sensitive: bool = True) -> list[str]:
+def dedup(l: list[str], suffix: str = "__", case_sensitive: bool = True) -> list[str]:  # noqa: E741
     """De-duplicates a list of string by suffixing a counter
 
     Always returns the same number of entries as provided, and always returns
@@ -60,7 +60,7 @@ def dedup(l: list[str], suffix: str = "__", case_sensitive: bool = True) -> list
 
 
 def stringify(obj: Any) -> str:
-    return json.dumps(obj, default=utils.json_iso_dttm_ser)
+    return json.dumps(obj, default=json.json_iso_dttm_ser)
 
 
 def stringify_values(array: NDArray[Any]) -> NDArray[Any]:
@@ -86,6 +86,32 @@ def destringify(obj: str) -> Any:
     return json.loads(obj)
 
 
+def stringify_extension_columns(table: pa.Table) -> pa.Table:
+    """
+    Replace Arrow extension-typed columns with their string representation.
+
+    Superset cannot render Arrow extension types natively (see
+    ``superset.utils.core.GenericDataType``). The most common case is the
+    canonical ``uuid`` type: PyArrow >= 21 infers Python ``uuid.UUID`` values as
+    that extension type (16-byte binary), which ``Table.to_pandas()`` surfaces as
+    raw bytes. Stringifying here keeps such columns readable (UUID values become
+    their canonical hex form). Plain binary/BLOB columns are not extension types
+    and are left untouched.
+    """
+    for index in range(table.num_columns):
+        field = table.schema.field(index)
+        if isinstance(field.type, pa.BaseExtensionType):
+            stringified = pa.array(
+                [
+                    None if value is None else str(value)
+                    for value in table.column(index).to_pylist()
+                ],
+                type=pa.string(),
+            )
+            table = table.set_column(index, field.name, stringified)
+    return table
+
+
 def convert_to_string(value: Any) -> str:
     """
     Used to ensure column names from the cursor description are strings.
@@ -99,8 +125,40 @@ def convert_to_string(value: Any) -> str:
     return str(value)
 
 
+def normalize_cursor_description_names(
+    cursor_description: DbapiDescription,
+) -> list[str]:
+    """
+    Replace empty cursor.description names with synthetic names that do not
+    collide with any explicit column names.
+    """
+    normalized_names: list[str] = []
+    unavailable_names = {
+        convert_to_string(col[0])
+        for col in cursor_description
+        if convert_to_string(col[0])
+    }
+    synthetic_index = 0
+
+    for col in cursor_description:
+        column_name = convert_to_string(col[0])
+        if column_name:
+            normalized_names.append(column_name)
+            continue
+
+        while True:
+            synthetic_name = f"_col_{synthetic_index}"
+            synthetic_index += 1
+            if synthetic_name not in unavailable_names:
+                unavailable_names.add(synthetic_name)
+                normalized_names.append(synthetic_name)
+                break
+
+    return normalized_names
+
+
 class SupersetResultSet:
-    def __init__(  # pylint: disable=too-many-locals
+    def __init__(  # pylint: disable=too-many-locals  # noqa: C901
         self,
         data: DbapiResult,
         cursor_description: DbapiDescription,
@@ -113,17 +171,26 @@ class SupersetResultSet:
         deduped_cursor_desc: list[tuple[Any, ...]] = []
         numpy_dtype: list[tuple[str, ...]] = []
         stringified_arr: NDArray[Any]
+        # Track columns with nested/JSON data to preserve them as objects
+        self._nested_columns: dict[str, list[Any]] = {}
 
         if cursor_description:
             # get deduped list of column names
-            column_names = dedup(
-                [convert_to_string(col[0]) for col in cursor_description]
-            )
+            # Some databases (e.g. SQL Server) return an empty string as the
+            # column name for un-aliased expressions like SELECT COUNT(*).
+            # An empty field name is illegal in NumPy structured arrays and in
+            # PyArrow tables, so we substitute a synthetic name when needed.
+            # Synthetic names are chosen to avoid colliding with any explicit
+            # column names before deduplication runs.
+            # See https://github.com/apache/superset/issues/23848
+            column_names = dedup(normalize_cursor_description_names(cursor_description))
 
             # fix cursor descriptor with the deduped names
             deduped_cursor_desc = [
-                tuple([column_name, *list(description)[1:]])
-                for column_name, description in zip(column_names, cursor_description)
+                tuple([column_name, *list(description)[1:]])  # noqa: C409
+                for column_name, description in zip(
+                    column_names, cursor_description, strict=False
+                )
             ]
 
             # generate numpy structured array dtype
@@ -132,47 +199,64 @@ class SupersetResultSet:
         # only do expensive recasting if datatype is not standard list of tuples
         if data and (not isinstance(data, list) or not isinstance(data[0], tuple)):
             data = [tuple(row) for row in data]
-        array = np.array(data, dtype=numpy_dtype)
-        if array.size > 0:
-            for column in column_names:
-                try:
-                    pa_data.append(pa.array(array[column].tolist()))
-                except (
-                    pa.lib.ArrowInvalid,
-                    pa.lib.ArrowTypeError,
-                    pa.lib.ArrowNotImplementedError,
-                    ValueError,
-                    TypeError,  # this is super hackey,
-                    # https://issues.apache.org/jira/browse/ARROW-7855
+        columns = np.array(data, dtype=numpy_dtype)
+
+        for column in column_names:
+            col_values = columns[column].tolist()
+            if db_engine_spec.requires_column_value_normalization:
+                col_values = db_engine_spec.normalize_column_values(col_values)
+            try:
+                pa_data.append(pa.array(col_values))
+            except (
+                pa.lib.ArrowInvalid,
+                pa.lib.ArrowTypeError,
+                pa.lib.ArrowNotImplementedError,
+                ValueError,
+                TypeError,  # this is super hackey,
+                # https://issues.apache.org/jira/browse/ARROW-7855
+            ):
+                # Check if original data has nested types (lists/dicts)
+                # before stringifying, since stringification removes
+                # the nested structure that the second loop relies on
+                # to detect via pa.types.is_nested().
+                original_values = columns[column].tolist()
+                if any(
+                    isinstance(v, (list, dict))
+                    for v in original_values
+                    if v is not None
                 ):
-                    # attempt serialization of values as strings
-                    stringified_arr = stringify_values(array[column])
-                    pa_data.append(pa.array(stringified_arr.tolist()))
+                    self._nested_columns[column] = original_values
+                # attempt serialization of values as strings
+                stringified_arr = stringify_values(columns[column])
+                pa_data.append(pa.array(stringified_arr.tolist()))
 
         if pa_data:  # pylint: disable=too-many-nested-blocks
             for i, column in enumerate(column_names):
                 if pa.types.is_nested(pa_data[i].type):
-                    # TODO: revisit nested column serialization once nested types
-                    #  are added as a natively supported column type in Superset
-                    #  (superset.utils.core.GenericDataType).
-                    stringified_arr = stringify_values(array[column])
+                    # Preserve nested/JSON data as Python objects for use in
+                    # templates like Handlebars. Store original values before
+                    # stringifying for PyArrow compatibility.
+                    # See: https://github.com/apache/superset/issues/25125
+                    self._nested_columns[column] = columns[column].tolist()
+                    stringified_arr = stringify_values(columns[column])
                     pa_data[i] = pa.array(stringified_arr.tolist())
 
                 elif pa.types.is_temporal(pa_data[i].type):
                     # workaround for bug converting
                     # `psycopg2.tz.FixedOffsetTimezone` tzinfo values.
                     # related: https://issues.apache.org/jira/browse/ARROW-5248
-                    sample = self.first_nonempty(array[column])
+                    sample = self.first_nonempty(columns[column])
                     if sample and isinstance(sample, datetime.datetime):
                         try:
                             if sample.tzinfo:
                                 tz = sample.tzinfo
-                                series = pd.Series(
-                                    array[column], dtype="datetime64[ns]"
+                                series = pd.Series(columns[column])
+                                series = pd.to_datetime(
+                                    series, utc=True, errors="coerce"
                                 )
-                                series = pd.to_datetime(series).dt.tz_localize(tz)
                                 pa_data[i] = pa.Array.from_pandas(
-                                    series, type=pa.timestamp("ns", tz=tz)
+                                    series,
+                                    type=pa.timestamp("ns", tz=tz),
                                 )
                         except Exception as ex:  # pylint: disable=broad-except
                             logger.exception(ex)
@@ -180,7 +264,13 @@ class SupersetResultSet:
         if not pa_data:
             column_names = []
 
-        self.table = pa.Table.from_arrays(pa_data, names=column_names)
+        # PyArrow >= 21 infers Python `uuid.UUID` values as the Arrow `uuid`
+        # extension type rather than raising (which previously routed them
+        # through the stringification fallback above). Stringify any extension
+        # columns so they render as readable text instead of raw bytes.
+        self.table = stringify_extension_columns(
+            pa.Table.from_arrays(pa_data, names=column_names)
+        )
         self._type_dict: dict[str, Any] = {}
         try:
             # The driver may not be passing a cursor.description
@@ -223,18 +313,34 @@ class SupersetResultSet:
             return False
         return column_spec.is_dttm
 
+    def type_generic(
+        self, db_type_str: Optional[str]
+    ) -> Optional[utils.GenericDataType]:
+        column_spec = self.db_engine_spec.get_column_spec(db_type_str)
+        if column_spec is None:
+            return None
+
+        if column_spec.is_dttm:
+            return GenericDataType.TEMPORAL
+
+        return column_spec.generic_type
+
     def data_type(self, col_name: str, pa_dtype: pa.DataType) -> Optional[str]:
         """Given a pyarrow data type, Returns a generic database type"""
-        if set_type := self._type_dict.get(col_name):
-            return set_type
-
-        if mapped_type := self.convert_pa_dtype(pa_dtype):
-            return mapped_type
-
-        return None
+        set_type = self._type_dict.get(col_name)
+        pa_mapped = self.convert_pa_dtype(pa_dtype)
+        return self.db_engine_spec.resolve_column_type(set_type, pa_mapped)
 
     def to_pandas_df(self) -> pd.DataFrame:
-        return self.convert_table_to_df(self.table)
+        df = self.convert_table_to_df(self.table)
+        # Restore nested/JSON columns as Python objects instead of strings
+        # This allows JSON data to be used directly in templates like Handlebars.
+        # Nested column keys are drawn from the same column_names used to build
+        # the table/df, so every key is guaranteed to be present as a column.
+        for column, values in self._nested_columns.items():
+            assert column in df.columns
+            df[column] = values
+        return df
 
     @property
     def pa_table(self) -> pa.Table:
@@ -256,7 +362,8 @@ class SupersetResultSet:
                 "column_name": col.name,
                 "name": col.name,
                 "type": db_type_str,
-                "is_dttm": self.is_temporal(db_type_str),
+                "type_generic": self.type_generic(db_type_str),
+                "is_dttm": self.is_temporal(db_type_str) or False,
             }
             columns.append(column)
         return columns

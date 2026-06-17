@@ -16,36 +16,68 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
 import thunk from 'redux-thunk';
-import { Provider } from 'react-redux';
 import configureStore from 'redux-mock-store';
 
 import {
   ensureIsArray,
-  FeatureFlag,
-  GenericDataType,
   QueryFormData,
+  QueryFormMetric,
 } from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
 import { ColumnMeta } from '@superset-ui/chart-controls';
-import { TimeseriesDefaultFormData } from '@superset-ui/plugin-chart-echarts';
-
-import { render, screen } from 'spec/helpers/testing-library';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from 'spec/helpers/testing-library';
+import { useDroppable } from '@dnd-kit/core';
 import AdhocMetric from 'src/explore/components/controls/MetricControl/AdhocMetric';
 import AdhocFilter from 'src/explore/components/controls/FilterControl/AdhocFilter';
+import { Operators } from 'src/explore/constants';
 import {
   DndFilterSelect,
   DndFilterSelectProps,
 } from 'src/explore/components/controls/DndColumnSelectControl/DndFilterSelect';
 import { PLACEHOLDER_DATASOURCE } from 'src/dashboard/constants';
-import { EXPRESSION_TYPES } from '../FilterControl/types';
+import { ExpressionTypes } from '../FilterControl/types';
+import { DndItemType } from '../../DndItemType';
+import { Datasource } from '../../../types';
+import {
+  CapturedDroppable,
+  captureDroppableData,
+  simulateDrop,
+} from './dndTestUtils';
 
-const defaultProps: DndFilterSelectProps = {
+jest.mock('src/core/editors', () => ({
+  EditorHost: ({ value }: { value: string }) => (
+    <div data-test="react-ace">{value}</div>
+  ),
+}));
+
+jest.mock('@dnd-kit/core', () => ({
+  ...jest.requireActual('@dnd-kit/core'),
+  useDroppable: jest.fn(),
+}));
+
+const captured: CapturedDroppable = { current: undefined };
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  captured.current = undefined;
+  (useDroppable as jest.Mock).mockImplementation(
+    captureDroppableData(captured),
+  );
+});
+
+const defaultProps: Omit<DndFilterSelectProps, 'datasource'> = {
   type: 'DndFilterSelect',
   name: 'Filter',
   value: [],
   columns: [],
-  datasource: PLACEHOLDER_DATASOURCE,
   formData: null,
   savedMetrics: [],
   selectedMetrics: [],
@@ -58,40 +90,36 @@ const baseFormData = {
   datasource: 'table__1',
 };
 
-beforeAll(() => {
-  window.featureFlags = { [FeatureFlag.ENABLE_EXPLORE_DRAG_AND_DROP]: true };
-});
-
-afterAll(() => {
-  window.featureFlags = {};
-});
-
 const mockStore = configureStore([thunk]);
-const store = mockStore({});
+const store = mockStore({ explore: {} });
 
 function setup({
   value = undefined,
   formData = baseFormData,
   columns = [],
+  datasource = PLACEHOLDER_DATASOURCE,
+  additionalProps = {},
 }: {
-  value?: AdhocFilter;
+  value?: AdhocFilter | AdhocFilter[];
   formData?: QueryFormData;
   columns?: ColumnMeta[];
+  datasource?: Datasource;
+  additionalProps?: Partial<DndFilterSelectProps>;
 } = {}) {
   return (
-    <Provider store={store}>
-      <DndFilterSelect
-        {...defaultProps}
-        value={ensureIsArray(value)}
-        formData={formData}
-        columns={columns}
-      />
-    </Provider>
+    <DndFilterSelect
+      {...defaultProps}
+      datasource={datasource}
+      value={ensureIsArray(value)}
+      formData={formData}
+      columns={columns}
+      {...additionalProps}
+    />
   );
 }
 
 test('renders with default props', async () => {
-  render(setup(), { useDnd: true });
+  render(setup(), { useDndKit: true, store });
   expect(
     await screen.findByText('Drop columns/metrics here or click'),
   ).toBeInTheDocument();
@@ -100,10 +128,11 @@ test('renders with default props', async () => {
 test('renders with value', async () => {
   const value = new AdhocFilter({
     sqlExpression: 'COUNT(*)',
-    expressionType: EXPRESSION_TYPES.SQL,
+    expressionType: ExpressionTypes.Sql,
   });
   render(setup({ value }), {
-    useDnd: true,
+    useDndKit: true,
+    store,
   });
   expect(await screen.findByText('COUNT(*)')).toBeInTheDocument();
 });
@@ -113,12 +142,12 @@ test('renders options with saved metric', async () => {
     setup({
       formData: {
         ...baseFormData,
-        ...TimeseriesDefaultFormData,
         metrics: ['saved_metric'],
       },
     }),
     {
-      useDnd: true,
+      useDndKit: true,
+      store,
     },
   );
   expect(
@@ -133,13 +162,14 @@ test('renders options with column', async () => {
         {
           id: 1,
           type: 'VARCHAR',
-          type_generic: GenericDataType.STRING,
+          type_generic: GenericDataType.String,
           column_name: 'Column',
         },
       ],
     }),
     {
-      useDnd: true,
+      useDndKit: true,
+      store,
     },
   );
   expect(
@@ -156,15 +186,234 @@ test('renders options with adhoc metric', async () => {
     setup({
       formData: {
         ...baseFormData,
-        ...TimeseriesDefaultFormData,
-        metrics: [adhocMetric],
+        metrics: [adhocMetric as unknown as QueryFormMetric],
       },
     }),
     {
-      useDnd: true,
+      useDndKit: true,
+      store,
     },
   );
   expect(
     await screen.findByText('Drop columns/metrics here or click'),
   ).toBeInTheDocument();
+});
+
+test('cannot drop a column that is not part of the simple column selection', async () => {
+  const adhocMetric = new AdhocMetric({
+    expression: 'AVG(birth_names.num)',
+    metric_name: 'avg__num',
+  });
+  render(
+    setup({
+      formData: {
+        ...baseFormData,
+        metrics: [adhocMetric as unknown as QueryFormMetric],
+      },
+      columns: [{ column_name: 'order_date' }],
+    }),
+    {
+      useDndKit: true,
+      store,
+    },
+  );
+
+  // A column missing from the simple column selection is rejected by canDrop,
+  // so no filter popover opens.
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.Column,
+      value: { column_name: 'address_line1' } as any,
+    });
+  });
+  expect(screen.queryByTestId('filter-edit-popover')).not.toBeInTheDocument();
+
+  // An acceptable column opens the popover prefilled with that column.
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.Column,
+      value: { column_name: 'order_date' } as any,
+    });
+  });
+  const filterConfigPopup = await screen.findByTestId('filter-edit-popover');
+  expect(within(filterConfigPopup).getByText('order_date')).toBeInTheDocument();
+
+  fireEvent.keyDown(filterConfigPopup, {
+    key: 'Escape',
+    code: 'Escape',
+    keyCode: 27,
+    charCode: 27,
+  });
+  await waitFor(() =>
+    expect(screen.queryByTestId('filter-edit-popover')).not.toBeInTheDocument(),
+  );
+
+  // A metric type is accepted (adhoc metrics are allowed here).
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.Metric,
+      value: {
+        metric_name: 'metric_a',
+        expression: 'AGG(metric_a)',
+        uuid: '1',
+      } as any,
+    });
+  });
+  const metricPopup = await screen.findByTestId('filter-edit-popover');
+  expect(within(metricPopup).getByTestId('react-ace')).toHaveTextContent(
+    'AGG(metric_a)',
+  );
+});
+
+test('when disallow_adhoc_metrics is set, can drop a column from the simple column selection', async () => {
+  const adhocMetric = new AdhocMetric({
+    expression: 'AVG(birth_names.num)',
+    metric_name: 'avg__num',
+  });
+  render(
+    setup({
+      formData: {
+        ...baseFormData,
+        metrics: [adhocMetric as unknown as QueryFormMetric],
+      },
+      datasource: {
+        ...PLACEHOLDER_DATASOURCE,
+        extra: '{ "disallow_adhoc_metrics": true }',
+      },
+      columns: [{ column_name: 'column_a' }, { column_name: 'column_b' }],
+    }),
+    {
+      useDndKit: true,
+      store,
+    },
+  );
+
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.Column,
+      value: { column_name: 'column_b' } as any,
+    });
+  });
+
+  const filterConfigPopup = await screen.findByTestId('filter-edit-popover');
+  expect(within(filterConfigPopup).getByText('column_b')).toBeInTheDocument();
+});
+
+test('when disallow_adhoc_metrics is set, cannot drop anything but a simple column selection', async () => {
+  const adhocMetric = new AdhocMetric({
+    expression: 'AVG(birth_names.num)',
+    metric_name: 'avg__num',
+  });
+  render(
+    setup({
+      formData: {
+        ...baseFormData,
+        metrics: [adhocMetric as unknown as QueryFormMetric],
+      },
+      datasource: {
+        ...PLACEHOLDER_DATASOURCE,
+        extra: '{ "disallow_adhoc_metrics": true }',
+      },
+      columns: [{ column_name: 'column_a' }, { column_name: 'column_c' }],
+    }),
+    {
+      useDndKit: true,
+      store,
+    },
+  );
+
+  // A metric is rejected when adhoc metrics are disallowed.
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.Metric,
+      value: { metric_name: 'metric_a', uuid: '1' } as any,
+    });
+  });
+  expect(screen.queryByTestId('filter-edit-popover')).not.toBeInTheDocument();
+
+  // An adhoc metric option is likewise rejected.
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.AdhocMetricOption,
+      value: { metric_name: 'avg__num', uuid: '2' } as any,
+    });
+  });
+  expect(screen.queryByTestId('filter-edit-popover')).not.toBeInTheDocument();
+
+  // A column from the simple selection is accepted.
+  act(() => {
+    simulateDrop(captured, {
+      type: DndItemType.Column,
+      value: { column_name: 'column_c' } as any,
+    });
+  });
+  const filterConfigPopup = await screen.findByTestId('filter-edit-popover');
+  expect(within(filterConfigPopup).getByText('column_c')).toBeInTheDocument();
+});
+
+test('calls onChange when close is clicked and canDelete is true', () => {
+  const value1 = new AdhocFilter({
+    sqlExpression: 'COUNT(*)',
+    expressionType: ExpressionTypes.Sql,
+  });
+  const value2 = new AdhocFilter({
+    expressionType: ExpressionTypes.Simple,
+    subject: 'col',
+    comparator: 'val',
+    operator: Operators.Equals,
+  });
+  const canDelete = jest.fn();
+  canDelete.mockReturnValue(true);
+  render(setup({ value: [value1, value2], additionalProps: { canDelete } }), {
+    useDndKit: true,
+    store,
+  });
+  fireEvent.click(screen.getAllByTestId('remove-control-button')[0]);
+  expect(canDelete).toHaveBeenCalled();
+  expect(defaultProps.onChange).toHaveBeenCalledWith([value2]);
+});
+
+test('onChange is not called when close is clicked and canDelete is false', () => {
+  const value1 = new AdhocFilter({
+    sqlExpression: 'COUNT(*)',
+    expressionType: ExpressionTypes.Sql,
+  });
+  const value2 = new AdhocFilter({
+    expressionType: ExpressionTypes.Simple,
+    subject: 'col',
+    comparator: 'val',
+    operator: Operators.Equals,
+  });
+  const canDelete = jest.fn();
+  canDelete.mockReturnValue(false);
+  render(setup({ value: [value1, value2], additionalProps: { canDelete } }), {
+    useDndKit: true,
+    store,
+  });
+  fireEvent.click(screen.getAllByTestId('remove-control-button')[0]);
+  expect(canDelete).toHaveBeenCalled();
+  expect(defaultProps.onChange).not.toHaveBeenCalled();
+});
+
+test('onChange is not called when close is clicked and canDelete is string, warning is displayed', async () => {
+  const value1 = new AdhocFilter({
+    sqlExpression: 'COUNT(*)',
+    expressionType: ExpressionTypes.Sql,
+  });
+  const value2 = new AdhocFilter({
+    expressionType: ExpressionTypes.Simple,
+    subject: 'col',
+    comparator: 'val',
+    operator: Operators.Equals,
+  });
+  const canDelete = jest.fn();
+  canDelete.mockReturnValue('Test warning');
+  render(setup({ value: [value1, value2], additionalProps: { canDelete } }), {
+    useDndKit: true,
+    store,
+  });
+  fireEvent.click(screen.getAllByTestId('remove-control-button')[0]);
+  expect(canDelete).toHaveBeenCalled();
+  expect(defaultProps.onChange).not.toHaveBeenCalled();
+  expect(await screen.findByText('Test warning')).toBeInTheDocument();
 });

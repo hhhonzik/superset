@@ -20,6 +20,7 @@ from flask_babel import lazy_gettext as _
 from sqlalchemy.engine.url import URL
 from sqlalchemy.exc import NoSuchModuleError
 
+from superset import feature_flag_manager
 from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
 from superset.exceptions import SupersetSecurityException
 
@@ -28,12 +29,18 @@ BLOCKLIST = {
     # sqlite creates a local DB, which allows mapping server's filesystem
     re.compile(r"sqlite(?:\+[^\s]*)?$"),
     # shillelagh allows opening local files (eg, 'SELECT * FROM "csv:///etc/passwd"')
-    re.compile(r"shillelagh$"),
-    re.compile(r"shillelagh\+apsw$"),
+    re.compile(r"shillelagh(?:\+[^\s]*)?$"),
+    # duckdb exposes filesystem table-valued functions (read_csv_auto, read_text,
+    # read_parquet, glob, etc.) that grant arbitrary local file access. The
+    # motherduck cloud variant rides on the same dialect and is covered too.
+    re.compile(r"duckdb(?:\+[^\s]*)?$"),
 }
 
 
 def check_sqlalchemy_uri(uri: URL) -> None:
+    if not feature_flag_manager.is_feature_enabled("ENABLE_SUPERSET_META_DB"):
+        BLOCKLIST.add(re.compile(r"superset$"))
+
     for blocklist_regex in BLOCKLIST:
         if not re.match(blocklist_regex, uri.drivername):
             continue

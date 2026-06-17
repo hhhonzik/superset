@@ -17,9 +17,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
-from flask import current_app
+from flask import current_app as app
+from sqlalchemy.sql import compiler
 
 from superset.constants import EXAMPLES_DB_UUID
 
@@ -54,26 +55,25 @@ def get_or_create_db(
         )
         db.session.add(database)
         database.set_sqlalchemy_uri(sqlalchemy_uri)
-        db.session.commit()
 
     # todo: it's a bad idea to do an update in a get/create function
     if database and database.sqlalchemy_uri_decrypted != sqlalchemy_uri:
         database.set_sqlalchemy_uri(sqlalchemy_uri)
-        db.session.commit()
 
+    db.session.flush()
     return database
 
 
 def get_example_database() -> Database:
-    db_uri = (
-        current_app.config.get("SQLALCHEMY_EXAMPLES_URI")
-        or current_app.config["SQLALCHEMY_DATABASE_URI"]
-    )
-    return get_or_create_db("examples", db_uri)
+    # pylint: disable=import-outside-toplevel
+
+    return get_or_create_db("examples", app.config["SQLALCHEMY_EXAMPLES_URI"])
 
 
 def get_main_database() -> Database:
-    db_uri = current_app.config["SQLALCHEMY_DATABASE_URI"]
+    # pylint: disable=import-outside-toplevel
+
+    db_uri = app.config["SQLALCHEMY_DATABASE_URI"]
     return get_or_create_db("main", db_uri)
 
 
@@ -83,6 +83,24 @@ def remove_database(database: Database) -> None:
     # pylint: disable=import-outside-toplevel
     from superset import db
 
-    session = db.session
-    session.delete(database)
-    session.commit()
+    db.session.delete(database)
+    db.session.flush()
+
+
+def apply_mariadb_ddl_fix() -> None:
+    """
+    Fix MariaDB "NO CYCLE" syntax issue - MariaDB uses "NOCYCLE" (no space).
+
+    This fix will be included in SQLAlchemy v2.1.0.
+    See: https://github.com/sqlalchemy/sqlalchemy/blob/rel_2_1_0b1/lib/sqlalchemy/dialects/mysql/_mariadb_shim.py
+    """
+    original_visit_create_sequence = compiler.DDLCompiler.visit_create_sequence
+
+    def patched_visit_create_sequence(self: Any, create: Any, **kw: Any) -> str:
+        text = original_visit_create_sequence(self, create, **kw)
+        dialect_name = getattr(self.dialect, "name", "") or ""
+        if "mariadb" in dialect_name.lower():
+            return text.replace("NO CYCLE", "NOCYCLE")
+        return text
+
+    compiler.DDLCompiler.visit_create_sequence = patched_visit_create_sequence

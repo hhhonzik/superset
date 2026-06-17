@@ -14,43 +14,48 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import json
+from __future__ import annotations
+
 import logging
 from typing import Any, Optional, Union
-from urllib import request
-from urllib.error import URLError
 
-from celery.beat import SchedulingError
 from celery.utils.log import get_task_logger
+from flask import current_app
 from sqlalchemy import and_, func
+from sqlalchemy.orm import selectinload
 
-from superset import app, db, security_manager
+from superset import db, security_manager
 from superset.extensions import celery_app
 from superset.models.core import Log
 from superset.models.dashboard import Dashboard
-from superset.models.slice import Slice
 from superset.tags.models import Tag, TaggedObject
 from superset.utils.date_parser import parse_human_datetime
-from superset.utils.machine_auth import MachineAuthProvider
+from superset.utils.webdriver import WebDriverSelenium
 
 logger = get_task_logger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def get_payload(chart: Slice, dashboard: Optional[Dashboard] = None) -> dict[str, int]:
-    """Return payload for warming up a given chart/table cache."""
-    payload = {"chart_id": chart.id}
-    if dashboard:
-        payload["dashboard_id"] = dashboard.id
-    return payload
+def get_dash_url(dashboard: Dashboard) -> str:
+    """Return external URL for warming up a given dashboard cache."""
+    with current_app.test_request_context():
+        baseurl = (
+            # when running this as an async task, drop the request context with
+            # app.test_request_context()
+            current_app.config.get("WEBDRIVER_BASEURL")
+            or "{SUPERSET_WEBSERVER_PROTOCOL}://"
+            "{SUPERSET_WEBSERVER_ADDRESS}:"
+            "{SUPERSET_WEBSERVER_PORT}".format(**current_app.config)
+        )
+        return f"{baseurl.rstrip('/')}{dashboard.url}"
 
 
 class Strategy:  # pylint: disable=too-few-public-methods
     """
     A cache warm up strategy.
 
-    Each strategy defines a `get_payloads` method that returns a list of payloads to
-    send to the `/api/v1/chart/warm_up_cache` endpoint.
+    Each strategy defines a `get_urls` method that returns a list of dashboard URLs to
+    warm up using WebDriver.
 
     Strategies can be configured in `superset/config.py`:
 
@@ -71,15 +76,16 @@ class Strategy:  # pylint: disable=too-few-public-methods
     def __init__(self) -> None:
         pass
 
-    def get_payloads(self) -> list[dict[str, int]]:
-        raise NotImplementedError("Subclasses must implement get_payloads!")
+    def get_urls(self) -> list[str]:
+        raise NotImplementedError("Subclasses must implement get_urls!")
 
 
 class DummyStrategy(Strategy):  # pylint: disable=too-few-public-methods
     """
-    Warm up all charts.
+    Warm up all published dashboards.
 
-    This is a dummy strategy that will fetch all charts. Can be configured by:
+    This is a dummy strategy that will fetch all published dashboards.
+    Can be configured by:
 
         beat_schedule = {
             'cache-warmup-hourly': {
@@ -93,11 +99,16 @@ class DummyStrategy(Strategy):  # pylint: disable=too-few-public-methods
 
     name = "dummy"
 
-    def get_payloads(self) -> list[dict[str, int]]:
-        session = db.create_scoped_session()
-        charts = session.query(Slice).all()
+    def get_urls(self) -> list[str]:
+        # Use selectinload to avoid N+1 queries when checking dashboard.slices
+        dashboards = (
+            db.session.query(Dashboard)
+            .options(selectinload(Dashboard.slices))
+            .filter(Dashboard.published.is_(True))
+            .all()
+        )
 
-        return [get_payload(chart) for chart in charts]
+        return [get_dash_url(dashboard) for dashboard in dashboards if dashboard.slices]
 
 
 class TopNDashboardsStrategy(Strategy):  # pylint: disable=too-few-public-methods
@@ -125,12 +136,9 @@ class TopNDashboardsStrategy(Strategy):  # pylint: disable=too-few-public-method
         self.top_n = top_n
         self.since = parse_human_datetime(since) if since else None
 
-    def get_payloads(self) -> list[dict[str, int]]:
-        payloads = []
-        session = db.create_scoped_session()
-
+    def get_urls(self) -> list[str]:
         records = (
-            session.query(Log.dashboard_id, func.count(Log.dashboard_id))
+            db.session.query(Log.dashboard_id, func.count(Log.dashboard_id))
             .filter(and_(Log.dashboard_id.isnot(None), Log.dttm >= self.since))
             .group_by(Log.dashboard_id)
             .order_by(func.count(Log.dashboard_id).desc())
@@ -138,12 +146,11 @@ class TopNDashboardsStrategy(Strategy):  # pylint: disable=too-few-public-method
             .all()
         )
         dash_ids = [record.dashboard_id for record in records]
-        dashboards = session.query(Dashboard).filter(Dashboard.id.in_(dash_ids)).all()
-        for dashboard in dashboards:
-            for chart in dashboard.slices:
-                payloads.append(get_payload(chart, dashboard))
+        dashboards = (
+            db.session.query(Dashboard).filter(Dashboard.id.in_(dash_ids)).all()
+        )
 
-        return payloads
+        return [get_dash_url(dashboard) for dashboard in dashboards]
 
 
 class DashboardTagsStrategy(Strategy):  # pylint: disable=too-few-public-methods
@@ -168,16 +175,14 @@ class DashboardTagsStrategy(Strategy):  # pylint: disable=too-few-public-methods
         super().__init__()
         self.tags = tags or []
 
-    def get_payloads(self) -> list[dict[str, int]]:
-        payloads = []
-        session = db.create_scoped_session()
-
-        tags = session.query(Tag).filter(Tag.name.in_(self.tags)).all()
+    def get_urls(self) -> list[str]:
+        urls = []
+        tags = db.session.query(Tag).filter(Tag.name.in_(self.tags)).all()
         tag_ids = [tag.id for tag in tags]
 
         # add dashboards that are tagged
         tagged_objects = (
-            session.query(TaggedObject)
+            db.session.query(TaggedObject)
             .filter(
                 and_(
                     TaggedObject.object_type == "dashboard",
@@ -187,66 +192,16 @@ class DashboardTagsStrategy(Strategy):  # pylint: disable=too-few-public-methods
             .all()
         )
         dash_ids = [tagged_object.object_id for tagged_object in tagged_objects]
-        tagged_dashboards = session.query(Dashboard).filter(Dashboard.id.in_(dash_ids))
-        for dashboard in tagged_dashboards:
-            for chart in dashboard.slices:
-                payloads.append(get_payload(chart))
-
-        # add charts that are tagged
-        tagged_objects = (
-            session.query(TaggedObject)
-            .filter(
-                and_(
-                    TaggedObject.object_type == "chart",
-                    TaggedObject.tag_id.in_(tag_ids),
-                )
-            )
-            .all()
+        tagged_dashboards = db.session.query(Dashboard).filter(
+            Dashboard.id.in_(dash_ids)
         )
-        chart_ids = [tagged_object.object_id for tagged_object in tagged_objects]
-        tagged_charts = session.query(Slice).filter(Slice.id.in_(chart_ids))
-        for chart in tagged_charts:
-            payloads.append(get_payload(chart))
+        for dashboard in tagged_dashboards:
+            urls.append(get_dash_url(dashboard))
 
-        return payloads
+        return urls
 
 
 strategies = [DummyStrategy, TopNDashboardsStrategy, DashboardTagsStrategy]
-
-
-@celery_app.task(name="fetch_url")
-def fetch_url(data: str, headers: dict[str, str]) -> dict[str, str]:
-    """
-    Celery job to fetch url
-    """
-    result = {}
-    try:
-        baseurl = app.config["WEBDRIVER_BASEURL"]
-        url = f"{baseurl}api/v1/chart/warm_up_cache"
-        logger.info("Fetching %s with payload %s", url, data)
-        req = request.Request(
-            url, data=bytes(data, "utf-8"), headers=headers, method="PUT"
-        )
-        response = request.urlopen(  # pylint: disable=consider-using-with
-            req, timeout=600
-        )
-        logger.info(
-            "Fetched %s with payload %s, status code: %s", url, data, response.code
-        )
-        if response.code == 200:
-            result = {"success": data, "response": response.read().decode("utf-8")}
-        else:
-            result = {"error": data, "status_code": response.code}
-            logger.error(
-                "Error fetching %s with payload %s, status code: %s",
-                url,
-                data,
-                response.code,
-            )
-    except URLError as err:
-        logger.exception("Error warming up cache!")
-        result = {"error": data, "exception": str(err)}
-    return result
 
 
 @celery_app.task(name="cache-warmup")
@@ -256,7 +211,7 @@ def cache_warmup(
     """
     Warm up cache.
 
-    This task periodically hits charts to warm up the cache.
+    This task periodically hits dashboards to warm up the cache.
 
     """
     logger.info("Loading strategy")
@@ -265,7 +220,7 @@ def cache_warmup(
         if class_.name == strategy_name:  # type: ignore
             break
     else:
-        message = f"No strategy {strategy_name} found!"
+        message = "No strategy %s found!" % strategy_name
         logger.error(message, exc_info=True)
         return message
 
@@ -278,22 +233,39 @@ def cache_warmup(
         logger.exception(message)
         return message
 
-    user = security_manager.get_user_by_username(app.config["THUMBNAIL_SELENIUM_USER"])
-    cookies = MachineAuthProvider.get_auth_cookies(user)
-    headers = {
-        "Cookie": f"session={cookies.get('session', '')}",
-        "Content-Type": "application/json",
-    }
+    results: dict[str, list[str]] = {"success": [], "errors": []}
 
-    results: dict[str, list[str]] = {"scheduled": [], "errors": []}
-    for payload in strategy.get_payloads():
-        try:
-            payload = json.dumps(payload)
-            logger.info("Scheduling %s", payload)
-            fetch_url.delay(payload, headers)
-            results["scheduled"].append(payload)
-        except SchedulingError:
-            logger.exception("Error scheduling fetch_url for payload: %s", payload)
-            results["errors"].append(payload)
+    warmup_username = current_app.config.get("SUPERSET_CACHE_WARMUP_USER")
+    if not warmup_username:
+        message = (
+            "SUPERSET_CACHE_WARMUP_USER is not configured. Set it to a dedicated "
+            "least-privilege user with access to the dashboards you want warmed up."
+        )
+        logger.error(message)
+        return message
+
+    user = security_manager.find_user(username=warmup_username)
+    if not user:
+        message = (
+            f"Cache warmup user '{warmup_username}' not found. Please configure "
+            "SUPERSET_CACHE_WARMUP_USER with a valid username."
+        )
+        logger.error(message)
+        return message
+
+    wd = WebDriverSelenium(current_app.config["WEBDRIVER_TYPE"], user=user)
+
+    try:
+        for url in strategy.get_urls():
+            try:
+                logger.info("Fetching %s", url)
+                wd.get_screenshot(url, "grid-container")
+                results["success"].append(url)
+            except Exception:  # noqa: BLE001
+                logger.exception("Error warming up cache for %s", url)
+                results["errors"].append(url)
+    finally:
+        # Ensure WebDriver is properly cleaned up
+        wd.destroy()
 
     return results
